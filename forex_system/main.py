@@ -1,0 +1,601 @@
+# main.py — GODBOT v3.0
+import os
+os.environ["NUMBA_CACHE_DIR"] = r"C:\Users\micha\.numba_cache"
+
+import time
+import json
+import sys
+import threading
+import schedule
+import traceback
+
+import pytz
+import MetaTrader5 as mt5
+from datetime import datetime
+from typing import Optional
+
+from core.mt5_connector      import MT5Connector
+from core.indicators         import IndicatorEngine
+from signals.signal_engine   import SignalEngine
+from signals.ml_model        import MLSignalModel
+from risk.risk_manager       import RiskManager
+from execution.order_executor import OrderExecutor
+from monitoring.logger       import get_logger
+from monitoring.dashboard    import Dashboard
+from notifications.alert_manager import AlertManager
+from research.calendar_scanner  import CalendarScanner
+from research.sentiment_analyzer import SentimentAnalyzer
+from research.intermarket     import IntermarketAnalyzer
+from research.cot_reader      import COTReader
+from config.settings import (
+    CONFIG,
+    PROFILE_FILE,
+    SCALPER_SCAN_SECS,    DAYTRADER_SCAN_SECS,
+    SCALPER_TF_PRIMARY,   SCALPER_TF_CONFIRM,
+    DAYTRADER_TF_PRIMARY, DAYTRADER_TF_CONFIRM,
+    SCALPER_MAX_SPREAD,   DAYTRADER_MAX_SPREAD,
+    SCALPER_SIGNAL_SCORE, DAYTRADER_SIGNAL_SCORE,
+    SCALPER_SL_PIPS,      DAYTRADER_SL_PIPS,
+    SCALPER_TP_PIPS,      DAYTRADER_TP_PIPS,
+    LONDON_OPEN_CET,      NY_CLOSE_CET,
+    OVERLAP_START,        OVERLAP_END,
+    TRADER_NAME,          TRADER_TIMEZONE,
+)
+
+logger   = get_logger("Main")
+TIMEZONE = pytz.timezone(TRADER_TIMEZONE)
+
+ML_LABEL_MAP = {0: "HOLD", 1: "BUY", 2: "SELL"}
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Profile persistence
+# ──────────────────────────────────────────────────────────────────────────────
+class ProfileManager:
+    DEFAULT = {"style": "scalper", "mode": "1", "name": TRADER_NAME}
+
+    def load(self) -> dict:
+        try:
+            os.makedirs("data", exist_ok=True)
+            if os.path.exists(PROFILE_FILE):
+                with open(PROFILE_FILE) as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return self.DEFAULT.copy()
+
+    def save(self, profile: dict) -> None:
+        try:
+            os.makedirs("data", exist_ok=True)
+            with open(PROFILE_FILE, "w") as f:
+                json.dump(profile, f, indent=2)
+        except Exception as e:
+            logger.error(f"Profile save error: {e}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Interactive startup menu
+# ──────────────────────────────────────────────────────────────────────────────
+class StartupMenu:
+    STYLES = {"1": "scalper", "2": "daytrader"}
+    MODES  = {"1": "Signal Only", "2": "Semi Automated", "3": "Fully Automated"}
+
+    def __init__(self):
+        self.profile_mgr = ProfileManager()
+
+    def run(self) -> dict:
+        self._print_banner()
+        profile     = self.profile_mgr.load()
+        has_profile = os.path.exists(PROFILE_FILE)
+
+        if has_profile:
+            self._print_saved_profile(profile)
+            if self._ask("Use saved profile? (Y/N): ", ["y", "n"]) == "y":
+                logger.info(
+                    f"✅ Loaded profile: {profile['style'].title()} | Mode {profile['mode']}"
+                )
+                return profile
+
+        profile = self._select_settings(profile)
+        if self._ask("Save as profile? (Y/N): ", ["y", "n"]) == "y":
+            self.profile_mgr.save(profile)
+            print("  ✅ Profile saved!\n")
+        return profile
+
+    def _print_banner(self) -> None:
+        print("\n" + "=" * 60)
+        print("  🤖  GODBOT v3.0  —  Intelligent Forex Trading System")
+        print("=" * 60 + "\n")
+
+    def _print_saved_profile(self, profile: dict) -> None:
+        print("  📂  Saved Profile Found")
+        print(f"      Style : {profile.get('style', '?').title()}")
+        print(f"      Mode  : {profile.get('mode', '?')} — "
+              f"{self.MODES.get(profile.get('mode', '1'), '?')}")
+        print(f"      Name  : {profile.get('name', '?')}\n")
+
+    def _select_settings(self, profile: dict) -> dict:
+        print("  Select Trading Style:")
+        print("    1 = Scalper    (short-term, tight spreads)")
+        print("    2 = Day Trader (swing positions)\n")
+        style_key = self._ask("Style (1 or 2): ", ["1", "2"])
+        profile["style"] = self.STYLES[style_key]
+
+        print("\n  Select Operation Mode:")
+        for k, v in self.MODES.items():
+            print(f"    {k} = {v}")
+        profile["mode"] = self._ask("\nMode (1 / 2 / 3): ", ["1", "2", "3"])
+
+        name = input(f"  Trader name [{profile.get('name', TRADER_NAME)}]: ").strip()
+        if name:
+            profile["name"] = name
+        elif "name" not in profile:
+            profile["name"] = TRADER_NAME
+        print()
+        return profile
+
+    def _ask(self, prompt: str, choices: list) -> str:
+        while True:
+            answer = input(f"  {prompt}").strip().lower()
+            if answer in choices:
+                return answer
+            print(f"  ⚠️  Please enter: {' or '.join(choices)}")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Core system
+# ──────────────────────────────────────────────────────────────────────────────
+class ForexSystem:
+    MODE_NAMES = {"1": "Signal Only", "2": "Semi Automated", "3": "Fully Automated"}
+
+    def __init__(self, profile: dict):
+        self.profile  = profile
+        self.style    = profile["style"]
+        self.mode     = profile["mode"]
+        self._running = False
+        self._paused  = False
+
+        # Candle guard — tracks the last processed candle time per symbol
+        # so heavy computation (indicators + ML) only fires on a NEW candle,
+        # even though the scan loop runs every 10 s.
+        self._last_candle_time: dict = {}
+
+        self.connector   = MT5Connector()
+        self.indicators  = IndicatorEngine()
+        self.signal_eng  = SignalEngine()
+        self.ml_model    = MLSignalModel()
+        self.risk_mgr    = RiskManager()
+        self.executor    = OrderExecutor()
+        self.dashboard   = Dashboard()
+        self.alerts      = AlertManager()
+        self.calendar    = CalendarScanner()
+        self.sentiment   = SentimentAnalyzer()
+        self.intermarket = IntermarketAnalyzer()
+        self.cot         = COTReader()
+
+        self._start_keyboard_listener()
+
+    # ── startup ───────────────────────────────────────────────────────────────
+    def start(self) -> None:
+        if not self.connector.connect():
+            raise RuntimeError("Cannot connect to MT5 — is the terminal open?")
+
+        account = self.connector.get_account_info()
+        self._print_launch_summary(account)
+
+        if self.cot.should_update():
+            logger.info("📥 Downloading COT data…")
+            self.cot.download_cot_data()
+
+        self.calendar.print_todays_events()
+        self._load_ml_models()
+
+        self.alerts.system_online(
+            account.get("balance", 0),
+            self.style,
+            self.MODE_NAMES[self.mode],
+        )
+        print("\n  ⌨️  Keyboard: M=Menu  P=Pause  S=Sound  T=Telegram  Q=Quit\n")
+        self._running = True
+        self._run_loop()
+
+    def _print_launch_summary(self, account: dict) -> None:
+        print("\n" + "─" * 60)
+        print(f"  👤  Trader  : {self.profile.get('name', TRADER_NAME)}")
+        print(f"  💼  Style   : {self.style.title()}")
+        print(f"  🎮  Mode    : {self.mode} — {self.MODE_NAMES[self.mode]}")
+        print(f"  💰  Balance : {account.get('balance', 0):,.2f} {account.get('currency', '')}")
+        print(f"  📈  Equity  : {account.get('equity',  0):,.2f} {account.get('currency', '')}")
+        print(f"  🏦  Broker  : {account.get('company', 'Unknown')}")
+        print("─" * 60 + "\n")
+
+    def _load_ml_models(self) -> None:
+        logger.info("🤖 Loading / training ML model for EURUSD…")
+        loaded = self.ml_model.load("EURUSD")
+        if not loaded:
+            logger.info("   No saved model found — training from scratch…")
+            df_raw = self.connector.get_ohlcv(
+                "EURUSD",
+                SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY,
+                bars=5000,
+            )
+            if df_raw is not None and not df_raw.empty:
+                df = self.indicators.compute_all(df_raw)
+                if df is not None and not df.empty:
+                    self.ml_model.train(df, "EURUSD")
+                    logger.info("   ✅ ML model trained and saved.")
+                else:
+                    logger.warning("   ⚠️  Indicators returned empty data — skipping training.")
+            else:
+                logger.warning("   ⚠️  No OHLCV data — ML model not trained.")
+        else:
+            logger.info("   ✅ ML model loaded from disk.")
+
+    # ── main loop ─────────────────────────────────────────────────────────────
+    def _run_loop(self) -> None:
+        scan_secs = SCALPER_SCAN_SECS if self.style == "scalper" else DAYTRADER_SCAN_SECS
+        self.dashboard.set_scan_secs(scan_secs)
+
+        schedule.every(scan_secs).seconds.do(self._scan_markets)
+        schedule.every(30).seconds.do(self._monitor_positions)
+        schedule.every(60).seconds.do(self._update_trailing_stops)
+        schedule.every().day.at("23:45").do(self._close_all_day_trades)
+        schedule.every().day.at("23:55").do(self._daily_summary)
+
+        logger.info(
+            f"⏱  Scan: {scan_secs}s | Mode: {self.MODE_NAMES[self.mode]} | "
+            f"Style: {self.style.title()}"
+        )
+
+        while self._running:
+            try:
+                if not self._paused:
+                    schedule.run_pending()
+                    self.dashboard.display()
+                time.sleep(1)
+            except KeyboardInterrupt:
+                self.stop()
+            except Exception as e:
+                logger.error(f"Main loop error: {e}")
+                logger.debug(traceback.format_exc())
+                time.sleep(5)
+
+    # ── session helpers ───────────────────────────────────────────────────────
+    def _is_trading_session(self) -> bool:
+        hour = datetime.now(TIMEZONE).hour
+        return LONDON_OPEN_CET <= hour < NY_CLOSE_CET
+
+    def _is_overlap_session(self) -> bool:
+        hour = datetime.now(TIMEZONE).hour
+        return OVERLAP_START <= hour < OVERLAP_END
+
+    # ── scanning ──────────────────────────────────────────────────────────────
+    def _scan_markets(self) -> None:
+        if not self._is_trading_session():
+            logger.debug("Outside trading session — skipping scan.")
+            return
+        self._process_eurusd()
+
+    def _process_eurusd(self) -> None:
+        symbol = "EURUSD"
+        tf     = SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY
+
+        # ── Spread gate (runs every scan — cheap, catches spikes fast) ────────
+        tick     = mt5.symbol_info_tick(symbol)
+        sym_info = mt5.symbol_info(symbol)
+        if tick and sym_info:
+            spread = (tick.ask - tick.bid) / sym_info.point / 10
+            max_sp = SCALPER_MAX_SPREAD if self.style == "scalper" else DAYTRADER_MAX_SPREAD
+            if spread > max_sp:
+                logger.debug(f"Spread too wide: {spread:.1f} pips (max {max_sp})")
+                return
+
+        # ── Gate 1 — Calendar (runs every scan — cheap) ───────────────────────
+        safety = self.calendar.is_safe_to_trade(symbol, minutes_before=30, minutes_after=15)
+        if not safety["safe"]:
+            evt = safety["events"][0]
+            logger.debug(f"News block: {evt['event']} in {evt['minutes']} mins")
+            return
+
+        # ── Candle guard — skip heavy work if candle hasn't closed yet ─────────
+        # Fetches only the single most-recent bar to read its open timestamp.
+        # Cost: one tiny MT5 call (~0.5 ms). Saves: full indicator + ML run.
+        rates = mt5.copy_rates_from_pos(symbol, tf, 0, 1)
+        if rates is not None and len(rates) > 0:
+            candle_time = rates[0]["time"]          # UNIX timestamp of candle open
+            if self._last_candle_time.get(symbol) == candle_time:
+                logger.debug(f"Same candle ({symbol}) — skipping heavy computation.")
+                return                              # nothing new to evaluate
+            self._last_candle_time[symbol] = candle_time
+            logger.debug(
+                f"New candle detected ({symbol}) @ "
+                f"{datetime.utcfromtimestamp(candle_time).strftime('%H:%M:%S')} UTC"
+            )
+
+        # ── Gate 2 — Technical (only runs on new candle) ──────────────────────
+        df_raw = self.connector.get_ohlcv(symbol, tf)
+        if df_raw is None or df_raw.empty:
+            return
+        df = self.indicators.compute_all(df_raw)
+        if df is None or df.empty:
+            return
+        signal = self.signal_eng.evaluate(df, symbol)
+        if not signal:
+            return
+
+        min_score = SCALPER_SIGNAL_SCORE if self.style == "scalper" else DAYTRADER_SIGNAL_SCORE
+        if hasattr(signal, "score") and signal.score < min_score:
+            logger.debug(f"Signal score too low: {signal.score:.2f} (min {min_score})")
+            return
+
+        # ── Gate 3 — ML ───────────────────────────────────────────────────────
+        ml           = self.ml_model.predict(df)
+        ml_direction = ML_LABEL_MAP.get(ml["label"], str(ml["label"]))
+        if ml_direction != signal.signal.value or ml["confidence"] < CONFIG.ML_MIN_CONFIDENCE:
+            return
+
+        # ── Gate 4 — Sentiment ────────────────────────────────────────────────
+        sent = self.sentiment.get_symbol_sentiment(symbol)
+        if signal.signal.value == "BUY"  and sent["score"] < -0.1:
+            return
+        if signal.signal.value == "SELL" and sent["score"] >  0.1:
+            return
+
+        # ── Gate 5 — Intermarket ──────────────────────────────────────────────
+        inter = self.intermarket.get_intermarket_signal(symbol)
+        if signal.signal.value == "BUY"  and inter["score"] < -0.1:
+            return
+        if signal.signal.value == "SELL" and inter["score"] >  0.1:
+            return
+
+        # ── Gate 6 — COT ──────────────────────────────────────────────────────
+        cot = self.cot.get_cot_signal(symbol)
+        if signal.signal.value == "BUY"  and cot["bias"] == "Bearish":
+            return
+        if signal.signal.value == "SELL" and cot["bias"] == "Bullish":
+            return
+
+        # ── All gates passed — fire alert ─────────────────────────────────────
+        direction = signal.signal.value
+        common = dict(
+            symbol=symbol, entry=signal.entry, sl=signal.sl, tp=signal.tp,
+            confidence=ml["confidence"], reasons=signal.reasons,
+            style=self.style, atr=signal.atr,
+        )
+        if direction == "BUY":
+            self.alerts.buy_signal(**common)
+        else:
+            self.alerts.sell_signal(**common)
+
+        self.dashboard.log_signal(
+            symbol=symbol, direction=direction,
+            entry=signal.entry, sl=signal.sl, tp=signal.tp,
+            confidence=ml["confidence"],
+        )
+
+        # ── Mode 1 — signal only ──────────────────────────────────────────────
+        if self.mode == "1":
+            return
+
+        # ── Mode 2 — semi: ask user ───────────────────────────────────────────
+        if self.mode == "2":
+            print(
+                f"\n  ⚡ {direction} {symbol} @ {signal.entry:.5f}"
+                f"  SL {signal.sl:.5f}  TP {signal.tp:.5f}"
+            )
+            if input("  Execute trade? (Y/N): ").strip().lower() != "y":
+                return
+
+        # ── Modes 2 & 3 — place order ─────────────────────────────────────────
+        lot = self.risk_mgr.calculate_lot_size(
+            symbol=symbol,
+            sl_pips=SCALPER_SL_PIPS if self.style == "scalper" else DAYTRADER_SL_PIPS,
+        )
+        result = self.executor.send_market_order(
+            symbol=symbol, direction=direction, lot=lot,
+            sl=signal.sl, tp=signal.tp, magic=CONFIG.MAGIC_NUMBER,
+        )
+        if result:
+            self.alerts.trade_opened(
+                symbol=symbol, direction=direction, lot=lot,
+                entry=signal.entry, sl=signal.sl, tp=signal.tp,
+            )
+            logger.info(f"✅ Order placed: {direction} {symbol} lot={lot:.2f}")
+        else:
+            logger.warning(f"❌ Order failed: {symbol} {direction}")
+
+    # ── position monitoring ───────────────────────────────────────────────────
+    def _monitor_positions(self) -> None:
+        positions = mt5.positions_get(magic=CONFIG.MAGIC_NUMBER)
+        if not positions:
+            return
+
+        for pos in positions:
+            symbol    = pos.symbol
+            ticket    = pos.ticket
+            direction = "BUY" if pos.type == 0 else "SELL"
+            entry     = pos.price_open
+            lot       = pos.volume
+            pnl       = pos.profit
+            sl        = pos.sl
+            tp        = pos.tp
+
+            tick = mt5.symbol_info_tick(symbol)
+            if tick is None:
+                logger.warning(f"No tick for {symbol} — skipping {ticket}")
+                continue
+
+            current  = tick.bid if direction == "BUY" else tick.ask
+            sym_info = mt5.symbol_info(symbol)
+            point    = sym_info.point if sym_info else 0.00001
+
+            pips_to_sl = abs(current - sl) / point / 10 if sl else 999
+
+            # Danger check
+            danger_reasons: list = []
+            if pips_to_sl <= 5:
+                danger_reasons.append(f"SL very close ({pips_to_sl:.1f} pips)")
+            if pnl < -CONFIG.MAX_LOSS_PER_TRADE:
+                danger_reasons.append(f"Max loss breached (${pnl:.2f})")
+
+            if danger_reasons:
+                self.alerts.danger_exit(
+                    symbol=symbol,
+                    direction=direction,
+                    ticket=ticket,
+                    entry=entry,
+                    current=current,
+                    pnl=pnl,
+                    sl=sl,
+                    reasons=danger_reasons,
+                )
+                if self.mode == "3":
+                    result = self.executor.close_position(ticket)
+                    if result:
+                        self.alerts.trade_closed(
+                            symbol=symbol, direction=direction, ticket=ticket,
+                            entry=entry, close_price=current, pnl=pnl, lot=lot,
+                        )
+                        self.dashboard.log_trade(
+                            symbol=symbol, direction=direction,
+                            pnl=pnl, ticket=ticket,
+                        )
+
+            # TP proximity alert
+            if tp:
+                pips_to_tp = abs(current - tp) / point / 10
+                if pips_to_tp <= 3:
+                    self.alerts.potential_exit(
+                        symbol=symbol, direction=direction, ticket=ticket,
+                        entry=entry, current=current, pnl=pnl, tp=tp,
+                    )
+
+    # ── trailing stops ────────────────────────────────────────────────────────
+    def _update_trailing_stops(self) -> None:
+        if self.mode not in ("2", "3"):
+            return
+        positions = mt5.positions_get(magic=CONFIG.MAGIC_NUMBER)
+        if not positions:
+            return
+        for pos in positions:
+            try:
+                self.executor.modify_trailing_stop(
+                    ticket=pos.ticket,
+                    trail_pips=CONFIG.TRAILING_STOP_PIPS,
+                )
+            except Exception as e:
+                logger.debug(f"Trailing stop error for {pos.ticket}: {e}")
+
+    # ── end-of-day closure ────────────────────────────────────────────────────
+    def _close_all_day_trades(self) -> None:
+        if self.style != "scalper":
+            return
+        positions = mt5.positions_get(magic=CONFIG.MAGIC_NUMBER)
+        if not positions:
+            return
+        logger.info(f"🌙 EOD: closing {len(positions)} position(s)…")
+        for pos in positions:
+            symbol    = pos.symbol
+            direction = "BUY" if pos.type == 0 else "SELL"
+            pnl       = pos.profit
+            ticket    = pos.ticket
+
+            tick     = mt5.symbol_info_tick(symbol)
+            close_px = (tick.bid if direction == "BUY" else tick.ask) if tick else pos.price_current
+
+            result = self.executor.close_position(ticket)
+            if result:
+                self.alerts.trade_closed(
+                    symbol=symbol, direction=direction, ticket=ticket,
+                    entry=pos.price_open, close_price=close_px,
+                    pnl=pnl, lot=pos.volume,
+                )
+                self.dashboard.log_trade(
+                    symbol=pos.symbol,
+                    direction=direction,
+                    pnl=pnl,
+                    ticket=ticket,
+                )
+                logger.info(f"  ✅ Closed {symbol} ticket={ticket}  pnl={pnl:.2f}")
+            else:
+                logger.warning(f"  ❌ Could not close {symbol} ticket={ticket}")
+
+    # ── daily summary ─────────────────────────────────────────────────────────
+    def _daily_summary(self) -> None:
+        stats = self.dashboard.get_today_stats()
+
+        logger.info("=" * 50)
+        logger.info("📊  DAILY SUMMARY")
+        logger.info(f"   Signals   : {stats.get('total_signals',  0)}")
+        logger.info(f"   Trades    : {stats.get('total_trades',   0)}")
+        logger.info(f"   Winning   : {stats.get('winning_trades', 0)}")
+        logger.info(f"   Win rate  : {stats.get('win_rate',       0.0):.1f}%")
+        logger.info(f"   Total P&L : ${stats.get('total_pnl',    0.0):+.2f}")
+        logger.info("=" * 50)
+
+        self.alerts.daily_summary(
+            trades=stats.get("total_trades",   0),
+            winning=stats.get("winning_trades", 0),
+            total_pnl=stats.get("total_pnl",   0.0),
+            win_rate=stats.get("win_rate",      0.0),
+            signals=stats.get("total_signals",  0),
+        )
+        try:
+            self.dashboard.export_report()
+        except Exception as e:
+            logger.warning(f"Report export failed: {e}")
+
+    # ── keyboard listener ─────────────────────────────────────────────────────
+    def _start_keyboard_listener(self) -> None:
+        def _listen():
+            while True:
+                try:
+                    key = input().strip().upper()
+                except EOFError:
+                    break
+                if   key == "Q": self.stop()
+                elif key == "P":
+                    self._paused = not self._paused
+                    print(f"\n  {'⏸  Paused' if self._paused else '▶  Resumed'}\n")
+                elif key == "S": self.alerts.sound.toggle()
+                elif key == "T": self.alerts.telegram.toggle()
+                elif key == "M": self._show_runtime_menu()
+
+        threading.Thread(target=_listen, daemon=True).start()
+
+    def _show_runtime_menu(self) -> None:
+        print("\n" + "─" * 40)
+        print("  🎛  RUNTIME MENU")
+        print("─" * 40)
+        print(f"  Mode  : {self.mode} — {self.MODE_NAMES[self.mode]}")
+        print(f"  Style : {self.style.title()}")
+        print(f"  Sound : {'ON' if self.alerts.sound.enabled else 'OFF'}")
+        print(f"  TG    : {'ON' if self.alerts.telegram.enabled else 'OFF'}")
+        print("─" * 40)
+        print("  [1/2/3] Change mode   [S] Toggle sound")
+        print("  [T]     Toggle TG     [P] Pause/Resume")
+        print("  [Q]     Quit")
+        print("─" * 40 + "\n")
+
+    # ── shutdown ──────────────────────────────────────────────────────────────
+    def stop(self) -> None:
+        logger.info("\n🛑 Shutting down GODBOT…")
+        self._running = False
+        self.alerts.system_offline("Manual shutdown")
+        try:
+            self.dashboard.export_report()
+        except Exception:
+            pass
+        self.connector.disconnect()
+        print("\n  👋 GODBOT stopped cleanly.\n")
+        sys.exit(0)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+#  Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    menu    = StartupMenu()
+    profile = menu.run()
+    system  = ForexSystem(profile)
+    system.start()
