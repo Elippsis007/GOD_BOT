@@ -33,6 +33,9 @@ class TradingConfig:
     GEMINI_API_KEY: str  = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", "AIzaSyBKtwbd1e1M7tLYsMIrmibKTrTGAn01XZM"))
     GEMINI_ENABLED: bool = True
 
+    # ── Watchlist ─────────────────────────────────────────────────────────────
+    WATCHLIST: List[str] = field(default_factory=lambda: ["EURUSD"])
+
     # ── Symbols ───────────────────────────────────────────────────────────────
     SYMBOLS: List[str] = field(default_factory=lambda: [
         "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD",
@@ -118,7 +121,7 @@ class TradingConfig:
     SCALPER_SL_PIPS:      float = 6.0     # M5 needs wider SL than M1
     SCALPER_MAX_SPREAD:   float = 1.5     # max spread in pips
     SCALPER_SCAN_SECS:    int   = 30      # scan every 30s, candle every 5min
-    SCALPER_SIGNAL_SCORE: int   = 3       # minimum confluence score
+    SCALPER_SIGNAL_SCORE: int   = 5       # minimum confluence score
 
     # ── Day Trader Style ──────────────────────────────────────────────────────
     DAYTRADER_TF_PRIMARY:   int   = 900

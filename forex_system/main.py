@@ -182,6 +182,8 @@ class ForexSystem:
         if not self.connector.connect():
             raise RuntimeError("Cannot connect to MT5 — is the terminal open?")
 
+        self.risk_mgr.snapshot_session_equity()
+
         account = self.connector.get_account_info()
         self._print_launch_summary(account)
 
@@ -209,29 +211,28 @@ class ForexSystem:
         print(f"  💰  Balance : {account.get('balance', 0):,.2f} {account.get('currency', '')}")
         print(f"  📈  Equity  : {account.get('equity',  0):,.2f} {account.get('currency', '')}")
         print(f"  🏦  Broker  : {account.get('company', 'Unknown')}")
+        print(f"  📋  Watchlist: {', '.join(CONFIG.WATCHLIST)}")
         print("─" * 60 + "\n")
 
     def _load_ml_models(self) -> None:
-        logger.info("🤖 Loading / training ML model for EURUSD…")
-        loaded = self.ml_model.load("EURUSD")
-        if not loaded:
-            logger.info("   No saved model found — training from scratch…")
-            df_raw = self.connector.get_ohlcv(
-                "EURUSD",
-                SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY,
-                bars=5000,
-            )
-            if df_raw is not None and not df_raw.empty:
-                df = self.indicators.compute_all(df_raw)
-                if df is not None and not df.empty:
-                    self.ml_model.train(df, "EURUSD")
-                    logger.info("   ✅ ML model trained and saved.")
+        tf = SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY
+        for symbol in CONFIG.WATCHLIST:
+            logger.info(f"🤖 Loading / training ML model for {symbol}…")
+            loaded = self.ml_model.load(symbol)
+            if not loaded:
+                logger.info(f"   No saved model found for {symbol} — training from scratch…")
+                df_raw = self.connector.get_ohlcv(symbol, tf, bars=5000)
+                if df_raw is not None and not df_raw.empty:
+                    df = self.indicators.compute_all(df_raw)
+                    if df is not None and not df.empty:
+                        self.ml_model.train(df, symbol)
+                        logger.info(f"   ✅ ML model trained and saved for {symbol}.")
+                    else:
+                        logger.warning(f"   ⚠️  Indicators returned empty data for {symbol}.")
                 else:
-                    logger.warning("   ⚠️  Indicators returned empty data — skipping training.")
+                    logger.warning(f"   ⚠️  No OHLCV data for {symbol} — skipping.")
             else:
-                logger.warning("   ⚠️  No OHLCV data — ML model not trained.")
-        else:
-            logger.info("   ✅ ML model loaded from disk.")
+                logger.info(f"   ✅ ML model loaded from disk for {symbol}.")
 
     # ── main loop ─────────────────────────────────────────────────────────────
     def _run_loop(self) -> None:
@@ -245,8 +246,8 @@ class ForexSystem:
         schedule.every().day.at("23:55").do(self._daily_summary)
 
         logger.info(
-            f"⏱  Scan: {scan_secs}s | Mode: {self.MODE_NAMES[self.mode]} | "
-            f"Style: {self.style.title()}"
+            f"⚙️ Scan: {scan_secs}s | Mode: {self.MODE_NAMES[self.mode]} | "
+            f"Style: {self.style.title()} | Watchlist: {', '.join(CONFIG.WATCHLIST)}"
         )
 
         while self._running:
@@ -278,11 +279,12 @@ class ForexSystem:
     def _scan_markets(self) -> None:
         if not self._is_trading_session():
             return
-        self._process_eurusd()
+        for symbol in CONFIG.WATCHLIST:
+            self._process_symbol(symbol)
 
-    def _process_eurusd(self) -> None:
-        symbol = "EURUSD"
-        tf     = SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY
+    # ── per-symbol processing (replaces _process_eurusd) ─────────────────────
+    def _process_symbol(self, symbol: str) -> None:
+        tf = SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY
 
         # ── Spread gate ───────────────────────────────────────────────────────
         tick     = mt5.symbol_info_tick(symbol)
@@ -291,7 +293,7 @@ class ForexSystem:
             spread = (tick.ask - tick.bid) / sym_info.point / 10
             max_sp = SCALPER_MAX_SPREAD if self.style == "scalper" else DAYTRADER_MAX_SPREAD
             if spread > max_sp:
-                logger.debug(f"Spread too wide: {spread:.1f} pips (max {max_sp})")
+                logger.debug(f"[{symbol}] Spread too wide: {spread:.1f} pips (max {max_sp})")
                 return
 
         # ── Gate 1 — Calendar ─────────────────────────────────────────────────
@@ -299,8 +301,8 @@ class ForexSystem:
             symbol, minutes_before=30, minutes_after=15
         )
         if not safety["safe"]:
-            evt = safety["events"][0]
-            logger.debug(f"News block: {evt['event']} in {evt['minutes']} mins")
+            evt = safety["events"][0] if safety["events"] else {}
+            logger.debug(f"[{symbol}] News block: {evt.get('event', '?')}")
             return
 
         # ── Candle guard ──────────────────────────────────────────────────────
@@ -309,40 +311,40 @@ class ForexSystem:
         if rates is not None and len(rates) > 0:
             candle_time = rates[0]["time"]
             if self._last_candle_time.get(symbol) == candle_time:
-                logger.debug(f"Same candle ({symbol}) — skipping heavy computation.")
+                logger.debug(f"[{symbol}] Same candle — skipping heavy computation.")
                 return
             self._last_candle_time[symbol] = candle_time
             logger.debug(
-                f"New candle detected ({symbol}) @ "
+                f"[{symbol}] New candle @ "
                 f"{datetime.utcfromtimestamp(candle_time).strftime('%H:%M:%S')} UTC"
             )
 
         # ── Gate 2 — Technical ────────────────────────────────────────────────
         df_raw = self.connector.get_ohlcv(symbol, tf)
         if df_raw is None or df_raw.empty:
-            logger.debug("⛔ Gate 2 BLOCKED — no OHLCV data returned")
+            logger.debug(f"[{symbol}] ⛔ Gate 2 BLOCKED — no OHLCV data returned")
             return
         df = self.indicators.compute_all(df_raw)
         if df is None or df.empty:
-            logger.debug("⛔ Gate 2 BLOCKED — indicators returned empty DataFrame")
+            logger.debug(f"[{symbol}] ⛔ Gate 2 BLOCKED — indicators returned empty DataFrame")
             return
 
         signal = self.signal_eng.evaluate(df, symbol)
         if not signal:
-            logger.debug("⛔ Gate 2 BLOCKED — signal score too low (no signal returned)")
+            logger.debug(f"[{symbol}] ⛔ Gate 2 BLOCKED — signal score too low")
             return
 
         logger.debug(
-            f"✅ Gate 2 PASSED — {signal.signal.value} | "
+            f"[{symbol}] ✅ Gate 2 PASSED — {signal.signal.value} | "
             f"Strength={signal.strength:.2f} | Conf={signal.confidence:.0%}"
         )
 
         # ── Gate 3 — ML ───────────────────────────────────────────────────────
-        ml           = self.ml_model.predict(df)
+        ml           = self.ml_model.predict(df, symbol)
         ml_direction = ML_LABEL_MAP.get(ml["label"], str(ml["label"]))
 
         logger.debug(
-            f"🤖 ML prediction: {ml_direction} | "
+            f"[{symbol}] 🤖 ML prediction: {ml_direction} | "
             f"Confidence: {ml['confidence']:.0%} | "
             f"Required: {CONFIG.ML_MIN_CONFIDENCE:.0%} | "
             f"Signal wants: {signal.signal.value} | "
@@ -353,97 +355,65 @@ class ForexSystem:
 
         if ml_direction != signal.signal.value:
             logger.debug(
-                f"⛔ Gate 3 BLOCKED — ML disagrees: "
+                f"[{symbol}] ⛔ Gate 3 BLOCKED — ML disagrees: "
                 f"ML={ml_direction} vs Signal={signal.signal.value}"
             )
             return
         if ml["confidence"] < CONFIG.ML_MIN_CONFIDENCE:
             logger.debug(
-                f"⛔ Gate 3 BLOCKED — ML confidence too low: "
+                f"[{symbol}] ⛔ Gate 3 BLOCKED — ML confidence too low: "
                 f"{ml['confidence']:.0%} < {CONFIG.ML_MIN_CONFIDENCE:.0%}"
             )
             return
 
         logger.debug(
-            f"✅ Gate 3 PASSED — ML={ml_direction} Conf={ml['confidence']:.0%}"
+            f"[{symbol}] ✅ Gate 3 PASSED — ML={ml_direction} Conf={ml['confidence']:.0%}"
         )
 
         # ── Gate 4 — Sentiment (Day Trader only) ──────────────────────────────
-        # Scalper trades on M1 candles — sentiment updates every 30 minutes
-        # and is far too slow to be relevant for a 1-minute scalp trade.
         if self.style == "scalper":
-            logger.debug("⏭️  Gate 4 SKIPPED — Sentiment not used in Scalper mode")
+            logger.debug(f"[{symbol}] ⏭️  Gate 4 SKIPPED — Scalper mode")
         else:
             sent = self.sentiment.get_symbol_sentiment(symbol)
             logger.debug(
-                f"📰 Sentiment: {sent['label']} | "
-                f"Score: {sent['score']:+.3f} | "
-                f"Conf: {sent['confidence']:.0%} | "
-                f"Engine: {sent['engine']}"
+                f"[{symbol}] 📰 Sentiment: {sent['label']} | "
+                f"Score: {sent['score']:+.3f} | Conf: {sent['confidence']:.0%}"
             )
             if signal.signal.value == "BUY" and sent["score"] < -0.1:
-                logger.debug(
-                    f"⛔ Gate 4 BLOCKED — Sentiment bearish "
-                    f"({sent['score']:+.3f}) conflicts with BUY signal"
-                )
+                logger.debug(f"[{symbol}] ⛔ Gate 4 BLOCKED — Sentiment bearish")
                 return
             if signal.signal.value == "SELL" and sent["score"] > 0.1:
-                logger.debug(
-                    f"⛔ Gate 4 BLOCKED — Sentiment bullish "
-                    f"({sent['score']:+.3f}) conflicts with SELL signal"
-                )
+                logger.debug(f"[{symbol}] ⛔ Gate 4 BLOCKED — Sentiment bullish")
                 return
-            logger.debug(
-                f"✅ Gate 4 PASSED — Sentiment {sent['label']} ({sent['score']:+.3f})"
-            )
+            logger.debug(f"[{symbol}] ✅ Gate 4 PASSED — Sentiment {sent['label']}")
 
         # ── Gate 5 — Intermarket (Day Trader only) ────────────────────────────
-        # Intermarket correlations operate on H1/H4 timescales — irrelevant
-        # for M1 scalping where trades last 2-10 minutes.
         if self.style == "scalper":
-            logger.debug("⏭️  Gate 5 SKIPPED — Intermarket not used in Scalper mode")
+            logger.debug(f"[{symbol}] ⏭️  Gate 5 SKIPPED — Scalper mode")
         else:
             inter = self.intermarket.get_intermarket_signal(symbol)
-            logger.debug(
-                f"🌐 Intermarket score: {inter['score']:+.3f}"
-            )
+            logger.debug(f"[{symbol}] 🌐 Intermarket score: {inter['score']:+.3f}")
             if signal.signal.value == "BUY" and inter["score"] < -0.1:
-                logger.debug(
-                    f"⛔ Gate 5 BLOCKED — Intermarket bearish "
-                    f"({inter['score']:+.3f}) conflicts with BUY signal"
-                )
+                logger.debug(f"[{symbol}] ⛔ Gate 5 BLOCKED — Intermarket bearish")
                 return
             if signal.signal.value == "SELL" and inter["score"] > 0.1:
-                logger.debug(
-                    f"⛔ Gate 5 BLOCKED — Intermarket bullish "
-                    f"({inter['score']:+.3f}) conflicts with SELL signal"
-                )
+                logger.debug(f"[{symbol}] ⛔ Gate 5 BLOCKED — Intermarket bullish")
                 return
-            logger.debug(
-                f"✅ Gate 5 PASSED — Intermarket score={inter['score']:+.3f}"
-            )
+            logger.debug(f"[{symbol}] ✅ Gate 5 PASSED — Intermarket {inter['score']:+.3f}")
 
         # ── Gate 6 — COT (Day Trader only) ────────────────────────────────────
-        # COT data is published weekly — completely irrelevant for scalping.
-        # Only meaningful for multi-day swing/position trading.
         if self.style == "scalper":
-            logger.debug("⏭️  Gate 6 SKIPPED — COT not used in Scalper mode")
+            logger.debug(f"[{symbol}] ⏭️  Gate 6 SKIPPED — Scalper mode")
         else:
             cot = self.cot.get_cot_signal(symbol)
-            logger.debug(
-                f"📊 COT bias: {cot['bias']}"
-            )
+            logger.debug(f"[{symbol}] 📊 COT bias: {cot['bias']}")
             if signal.signal.value == "BUY" and cot["bias"] == "Bearish":
-                logger.debug(
-                    f"⛔ Gate 6 BLOCKED — COT bias Bearish conflicts with BUY signal"
-                )
+                logger.debug(f"[{symbol}] ⛔ Gate 6 BLOCKED — COT Bearish vs BUY")
                 return
             if signal.signal.value == "SELL" and cot["bias"] == "Bullish":
-                logger.debug(
-                    f"⛔ Gate 6 BLOCKED — COT bias Bullish conflicts with SELL signal"
-                )
+                logger.debug(f"[{symbol}] ⛔ Gate 6 BLOCKED — COT Bullish vs SELL")
                 return
-            logger.debug(f"✅ Gate 6 PASSED — COT bias={cot['bias']}")
+            logger.debug(f"[{symbol}] ✅ Gate 6 PASSED — COT bias={cot['bias']}")
 
         # ── All gates passed — fire alert ─────────────────────────────────────
         logger.info(
@@ -482,31 +452,35 @@ class ForexSystem:
 
         # ── Modes 2 & 3 — place order ─────────────────────────────────────────
         spec = self.risk_mgr.calculate_position(
-            symbol=symbol,
-            direction=direction,
-            entry=signal.entry,
-            sl=signal.sl,
-            tp=signal.tp,
+            symbol    = symbol,
+            direction = direction,
+            entry     = signal.entry,
+            sl        = signal.sl,
+            tp        = signal.tp,
+            win_rate  = ml["confidence"],
         )
         if spec is None:
-            logger.warning(f"⚠️ Position sizing rejected for {symbol} — skipping trade")
+            logger.warning(f"[{symbol}] ⚠️ Position sizing rejected — skipping trade")
             return
 
         result = self.executor.send_market_order(spec)
         if result:
             self.alerts.trade_opened(
-                symbol=symbol,
-                direction=direction,
-                ticket=result["ticket"],
-                entry=result["price"],
-                sl=spec.sl,
-                tp=spec.tp,
-                volume=spec.volume,
-                risk=spec.risk_usd,
-                style=self.style,
-                mode=self.MODE_NAMES[self.mode],
+                symbol    = symbol,
+                direction = direction,
+                ticket    = result["ticket"],
+                entry     = result["price"],
+                sl        = spec.sl,
+                tp        = spec.tp,
+                volume    = spec.volume,
+                risk      = spec.risk_usd,
+                style     = self.style,
+                mode      = self.MODE_NAMES[self.mode],
             )
-            logger.info(f"✅ Order placed: {direction} {symbol} lot={spec.volume:.2f}")
+            logger.info(
+                f"✅ Order placed: {direction} {symbol} "
+                f"lot={spec.volume:.2f} risk=€{spec.risk_usd:.2f}"
+            )
         else:
             logger.warning(f"❌ Order failed: {symbol} {direction}")
 
@@ -541,17 +515,12 @@ class ForexSystem:
             if pips_to_sl <= 5:
                 danger_reasons.append(f"SL very close ({pips_to_sl:.1f} pips)")
             if pnl < -CONFIG.MAX_LOSS_PER_TRADE:
-                danger_reasons.append(f"Max loss breached (${pnl:.2f})")
+                danger_reasons.append(f"Max loss breached (€{pnl:.2f})")
 
             if danger_reasons:
                 self.alerts.danger_exit(
-                    symbol=symbol,
-                    direction=direction,
-                    ticket=ticket,
-                    entry=entry,
-                    current=current,
-                    pnl=pnl,
-                    sl=sl,
+                    symbol=symbol, direction=direction, ticket=ticket,
+                    entry=entry, current=current, pnl=pnl, sl=sl,
                     reasons=danger_reasons,
                 )
                 if self.mode == "3":
@@ -561,32 +530,23 @@ class ForexSystem:
                         if direction == "SELL":
                             pips = -pips
                         self.alerts.trade_closed(
-                            symbol=symbol,
-                            direction=direction,
-                            ticket=ticket,
-                            entry=entry,
-                            close=current,
-                            pnl=pnl,
-                            pips=round(pips, 1),
-                            reason="Danger exit",
+                            symbol=symbol, direction=direction, ticket=ticket,
+                            entry=entry, close=current, pnl=pnl,
+                            pips=round(pips, 1), reason="Danger exit",
                         )
                         self.dashboard.log_trade(
                             symbol=symbol, direction=direction,
                             pnl=pnl, ticket=ticket,
                         )
+                        self.risk_mgr.record_trade_result(pnl)
 
             # ── TP proximity alert ────────────────────────────────────────────
             if tp:
                 pips_to_tp = abs(current - tp) / point / 10
                 if pips_to_tp <= 3:
                     self.alerts.potential_exit(
-                        symbol=symbol,
-                        direction=direction,
-                        ticket=ticket,
-                        entry=entry,
-                        current=current,
-                        pnl=pnl,
-                        tp=tp,
+                        symbol=symbol, direction=direction, ticket=ticket,
+                        entry=entry, current=current, pnl=pnl, tp=tp,
                         reasons=[f"Price within {pips_to_tp:.1f} pips of TP"],
                     )
 
@@ -602,9 +562,9 @@ class ForexSystem:
         for pos in positions:
             try:
                 self.executor.modify_trailing_stop(
-                    ticket=pos.ticket,
-                    symbol=pos.symbol,
-                    trail_points=trail_points,
+                    ticket       = pos.ticket,
+                    symbol       = pos.symbol,
+                    trail_points = trail_points,
                 )
             except Exception as e:
                 logger.debug(f"Trailing stop error for {pos.ticket}: {e}")
@@ -624,7 +584,10 @@ class ForexSystem:
             ticket    = pos.ticket
 
             tick     = mt5.symbol_info_tick(symbol)
-            close_px = (tick.bid if direction == "BUY" else tick.ask) if tick else pos.price_current
+            close_px = (
+                (tick.bid if direction == "BUY" else tick.ask)
+                if tick else pos.price_current
+            )
 
             result = self.executor.close_position(ticket)
             if result:
@@ -634,20 +597,16 @@ class ForexSystem:
                 if direction == "SELL":
                     pips = -pips
                 self.alerts.trade_closed(
-                    symbol=symbol,
-                    direction=direction,
-                    ticket=ticket,
-                    entry=pos.price_open,
-                    close=close_px,
-                    pnl=pnl,
-                    pips=round(pips, 1),
-                    reason="EOD close",
+                    symbol=symbol, direction=direction, ticket=ticket,
+                    entry=pos.price_open, close=close_px, pnl=pnl,
+                    pips=round(pips, 1), reason="EOD close",
                 )
                 self.dashboard.log_trade(
                     symbol=symbol, direction=direction,
                     pnl=pnl, ticket=ticket,
                 )
-                logger.info(f"  ✅ Closed {symbol} ticket={ticket}  pnl={pnl:.2f}")
+                self.risk_mgr.record_trade_result(pnl)
+                logger.info(f"  ✅ Closed {symbol} ticket={ticket} pnl=€{pnl:.2f}")
             else:
                 logger.warning(f"  ❌ Could not close {symbol} ticket={ticket}")
 
@@ -661,22 +620,22 @@ class ForexSystem:
         logger.info(f"   Trades    : {stats.get('trades',       0)}")
         logger.info(f"   Winning   : {stats.get('winners',      0)}")
         logger.info(f"   Win rate  : {stats.get('win_rate',     0.0):.1f}%")
-        logger.info(f"   Net P&L   : ${stats.get('net_pnl',    0.0):+.2f}")
-        logger.info(f"   Best      : ${stats.get('best_trade',  0.0):+.2f}")
-        logger.info(f"   Worst     : ${stats.get('worst_trade', 0.0):+.2f}")
+        logger.info(f"   Net P&L   : €{stats.get('net_pnl',    0.0):+.2f}")
+        logger.info(f"   Best      : €{stats.get('best_trade',  0.0):+.2f}")
+        logger.info(f"   Worst     : €{stats.get('worst_trade', 0.0):+.2f}")
         logger.info("=" * 50)
 
         self.alerts.daily_summary(
-            trades=stats.get("trades",        0),
-            winners=stats.get("winners",      0),
-            losers=stats.get("losers",        0),
-            net_pnl=stats.get("net_pnl",     0.0),
-            win_rate=stats.get("win_rate",   0.0),
-            signals=stats.get("signals",      0),
-            best_trade=stats.get("best_trade",   0.0),
-            worst_trade=stats.get("worst_trade", 0.0),
-            gross_profit=stats.get("gross_profit", 0.0),
-            gross_loss=stats.get("gross_loss",     0.0),
+            trades       = stats.get("trades",        0),
+            winners      = stats.get("winners",       0),
+            losers       = stats.get("losers",        0),
+            net_pnl      = stats.get("net_pnl",      0.0),
+            win_rate     = stats.get("win_rate",     0.0),
+            signals      = stats.get("signals",       0),
+            best_trade   = stats.get("best_trade",   0.0),
+            worst_trade  = stats.get("worst_trade",  0.0),
+            gross_profit = stats.get("gross_profit", 0.0),
+            gross_loss   = stats.get("gross_loss",   0.0),
         )
         try:
             self.dashboard.export_report()
@@ -705,10 +664,11 @@ class ForexSystem:
         print("\n" + "─" * 40)
         print("  🎛  RUNTIME MENU")
         print("─" * 40)
-        print(f"  Mode  : {self.mode} — {self.MODE_NAMES[self.mode]}")
-        print(f"  Style : {self.style.title()}")
-        print(f"  Sound : {'ON' if self.alerts.sound.enabled else 'OFF'}")
-        print(f"  TG    : {'ON' if self.alerts.telegram.enabled else 'OFF'}")
+        print(f"  Mode      : {self.mode} — {self.MODE_NAMES[self.mode]}")
+        print(f"  Style     : {self.style.title()}")
+        print(f"  Watchlist : {', '.join(CONFIG.WATCHLIST)}")
+        print(f"  Sound     : {'ON' if self.alerts.sound.enabled else 'OFF'}")
+        print(f"  TG        : {'ON' if self.alerts.telegram.enabled else 'OFF'}")
         print("─" * 40)
         print("  [1/2/3] Change mode   [S] Toggle sound")
         print("  [T]     Toggle TG     [P] Pause/Resume")

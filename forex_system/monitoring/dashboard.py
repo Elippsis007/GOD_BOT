@@ -4,7 +4,7 @@ import pandas as pd
 import json
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import List
 import pytz
 from config.settings import CONFIG
@@ -33,6 +33,7 @@ class Dashboard:
         self.cfg              = config
         self.signals_log: List[dict] = []
         self.trades_log:  List[dict] = []
+        self._all_trades: List[dict] = []
         self._scan_secs           = 60
         self._last_scan_time      = None
         self._scan_status         = "Waiting"
@@ -47,28 +48,43 @@ class Dashboard:
     # ── Persistence ───────────────────────────────────────────────────────────
     def _load_today(self) -> None:
         today = _now_madrid().strftime("%Y-%m-%d")
-        for attr, path in [
-            ("signals_log", "reports/signals_log.json"),
-            ("trades_log",  "reports/trades_log.json"),
-        ]:
-            try:
-                if os.path.exists(path):
-                    with open(path, "r") as f:
-                        all_entries = json.load(f)
-                    setattr(
-                        self, attr,
-                        [e for e in all_entries if e.get("date") == today],
-                    )
-            except Exception as e:
-                logger.debug(f"Load {attr} error: {e}")
-                setattr(self, attr, [])
+
+        # signals — today only
+        try:
+            if os.path.exists("reports/signals_log.json"):
+                with open("reports/signals_log.json", "r") as f:
+                    all_sigs = json.load(f)
+                self.signals_log = [e for e in all_sigs if e.get("date") == today]
+            else:
+                self.signals_log = []
+        except Exception as e:
+            logger.debug(f"Load signals_log error: {e}")
+            self.signals_log = []
+
+        # trades — today + full history
+        try:
+            if os.path.exists("reports/trades_log.json"):
+                with open("reports/trades_log.json", "r") as f:
+                    self._all_trades = json.load(f)
+                self.trades_log = [e for e in self._all_trades if e.get("date") == today]
+            else:
+                self._all_trades = []
+                self.trades_log  = []
+        except Exception as e:
+            logger.debug(f"Load trades_log error: {e}")
+            self._all_trades = []
+            self.trades_log  = []
 
     def _save_logs(self) -> None:
         try:
             with open("reports/signals_log.json", "w") as f:
                 json.dump(self.signals_log, f, indent=2)
+            # merge today into full history
+            today      = _now_madrid().strftime("%Y-%m-%d")
+            other_days = [t for t in self._all_trades if t.get("date") != today]
+            self._all_trades = other_days + self.trades_log
             with open("reports/trades_log.json", "w") as f:
-                json.dump(self.trades_log, f, indent=2)
+                json.dump(self._all_trades, f, indent=2)
         except Exception as e:
             logger.debug(f"Save logs error: {e}")
 
@@ -80,6 +96,7 @@ class Dashboard:
         self._positions_panel()
         self._signals_panel()
         self._performance_panel()
+        self._analytics_panel()
         self._footer()
 
     # ── Header ────────────────────────────────────────────────────────────────
@@ -207,6 +224,67 @@ class Dashboard:
         print(f"  Total P&L: {total:+.2f}")
         print(f"  Best     : {best:+.2f}")
         print(f"  Worst    : {worst:+.2f}")
+
+    # ── Analytics Panel ───────────────────────────────────────────────────────
+    def _analytics_panel(self) -> None:
+        print("\n📊 ROLLING ANALYTICS  (7-day)")
+        print("-" * 65)
+
+        cutoff    = (_now_madrid() - timedelta(days=7)).strftime("%Y-%m-%d")
+        trades_7d = [t for t in self._all_trades if t.get("date", "") >= cutoff]
+
+        if not trades_7d:
+            print("  No trade history yet — analytics will appear after first trades")
+            return
+
+        wins_7d   = [t for t in trades_7d if t["pnl"] > 0]
+        losses_7d = [t for t in trades_7d if t["pnl"] <= 0]
+        wr_7d     = len(wins_7d) / len(trades_7d) * 100
+        g_profit  = sum(t["pnl"] for t in wins_7d)          if wins_7d   else 0.0
+        g_loss    = abs(sum(t["pnl"] for t in losses_7d))   if losses_7d else 0.0
+        pf_7d     = (g_profit / g_loss)                      if g_loss   > 0 else 0.0
+        expect    = sum(t["pnl"] for t in trades_7d) / len(trades_7d)
+
+        print(f"  Trades (7d)  : {len(trades_7d)}")
+        print(f"  Win Rate     : {wr_7d:.1f}%")
+        print(f"  Profit Factor: {pf_7d:.3f}  {'✅' if pf_7d >= 1.5 else '⚠️'}")
+        print(f"  Expectancy   : €{expect:+.4f} per trade")
+
+        # ── Consecutive loss warning ───────────────────────────────────────
+        consec = 0
+        for t in reversed(trades_7d):
+            if t["pnl"] <= 0:
+                consec += 1
+            else:
+                break
+        if consec >= 3:
+            print(f"\n  ⚠️  WARNING: {consec} consecutive losses — consider pausing")
+        else:
+            print(f"  Consec Losses: {consec}  {'🟢' if consec == 0 else '🟡'}")
+
+        # ── Session breakdown ─────────────────────────────────────────────
+        sessions = {"Asian": [], "London": [], "NY": []}
+        for t in trades_7d:
+            try:
+                hour = int(t["time"].split(":")[0])
+            except Exception:
+                continue
+            if 0 <= hour < 8:
+                sessions["Asian"].append(t["pnl"])
+            elif 8 <= hour < 13:
+                sessions["London"].append(t["pnl"])
+            else:
+                sessions["NY"].append(t["pnl"])
+
+        print("\n  Session Breakdown:")
+        for name, pnls in sessions.items():
+            if not pnls:
+                continue
+            s_wins = sum(1 for p in pnls if p > 0)
+            s_wr   = s_wins / len(pnls) * 100
+            s_pnl  = sum(pnls)
+            icon   = "🟢" if s_pnl >= 0 else "🔴"
+            print(f"    {name:<8}: {len(pnls):>3} trades | WR {s_wr:>5.1f}% | {icon} €{s_pnl:+.2f}")
 
     # ── Footer ────────────────────────────────────────────────────────────────
     def _footer(self) -> None:

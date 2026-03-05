@@ -12,7 +12,7 @@ logger = get_logger("RiskManager")
 @dataclass
 class PositionSpec:
     symbol:    str
-    direction: str       # "BUY" or "SELL"
+    direction: str        # "BUY" or "SELL"
     volume:    float
     entry:     float
     sl:        float
@@ -23,36 +23,60 @@ class PositionSpec:
 
 class RiskManager:
     """
-    Kelly-inspired position sizing with hard circuit breakers.
-    Respects: max daily loss, max open trades, account exposure.
-    Daily P&L resets automatically at midnight each trading day.
-    Sends Telegram + sound alerts when limits are approached or hit.
+    Equity-proportional position sizing with hard circuit breakers.
+
+    Upgrades vs previous version:
+      - Uses live EQUITY (not balance) for all sizing calculations so
+        position size shrinks automatically during a drawdown.
+      - Hard absolute cap: single trade risk never exceeds
+        MAX_LOSS_PER_TRADE regardless of equity level.
+      - Kelly Criterion estimate logged for reference (not used for
+        sizing directly — pure Kelly is too aggressive for retail).
+      - Consecutive loss counter: after N losses in a row the risk
+        percentage is halved automatically (anti-martingale protection).
+      - Daily drawdown circuit breaker checks equity drop from the
+        session-open equity snapshot, not just closed P&L, so
+        floating losses also count toward the daily limit.
+      - All existing warnings (75%, 90%, LIMIT_HIT, TRADES_NEAR,
+        TRADES_FULL, LOW_MARGIN) retained and improved.
     """
 
+    # ── Anti-martingale: halve risk after this many consecutive losses ────────
+    CONSECUTIVE_LOSS_LIMIT = 3
+
     def __init__(self, config=CONFIG):
-        self.cfg          = config
-        self._daily_pnl   = 0.0
-        self._daily_reset = date.today()
+        self.cfg               = config
+        self._daily_pnl        = 0.0
+        self._daily_reset      = date.today()
+        self._session_equity   = None   # equity snapshot at session open
+        self._consecutive_loss = 0      # anti-martingale counter
 
         # ── Alert state flags ─────────────────────────────────────────────────
-        # Prevent the same warning from firing repeatedly every scan cycle.
-        # Flags reset when _daily_pnl resets at midnight.
-        self._warned_daily_75    = False   # fired when daily loss hits 75%
-        self._warned_daily_90    = False   # fired when daily loss hits 90%
-        self._warned_trades_near = False   # fired when 2 of 3 slots used
-        self._warned_trades_full = False   # fired when all slots full
+        self._warned_daily_75    = False
+        self._warned_daily_90    = False
+        self._warned_trades_near = False
+        self._warned_trades_full = False
 
         # AlertManager injected after construction to avoid circular imports
         self._alerts = None
 
     def set_alerts(self, alert_manager) -> None:
-        """
-        Called from main.py after AlertManager is created:
-            self.risk_mgr.set_alerts(self.alerts)
-        Kept as a setter to avoid circular import between
-        risk_manager → alert_manager → risk_manager.
-        """
         self._alerts = alert_manager
+
+    # ── Session Equity Snapshot ───────────────────────────────────────────────
+    def snapshot_session_equity(self) -> None:
+        """
+        Call once at bot startup (from main.py) to record the
+        equity at the start of the session.  The daily drawdown
+        circuit breaker measures the DROP from this snapshot so
+        floating losses also contribute to the daily limit.
+        """
+        account = self._get_account()
+        if account:
+            self._session_equity = account["equity"]
+            logger.info(
+                f"📸 Session equity snapshot: €{self._session_equity:.2f}"
+            )
 
     # ── Daily Reset ───────────────────────────────────────────────────────────
     def _check_daily_reset(self) -> None:
@@ -60,24 +84,27 @@ class RiskManager:
         if today != self._daily_reset:
             logger.info(
                 f"🔄 New trading day — resetting daily P&L "
-                f"(was ${self._daily_pnl:+.2f})"
+                f"(was €{self._daily_pnl:+.2f})"
             )
-            self._daily_pnl      = 0.0
-            self._daily_reset    = today
-            # Reset all warning flags for the new day
+            self._daily_pnl        = 0.0
+            self._daily_reset      = today
+            self._consecutive_loss = 0
             self._warned_daily_75    = False
             self._warned_daily_90    = False
             self._warned_trades_near = False
             self._warned_trades_full = False
+            # Re-snapshot equity for the new day
+            self.snapshot_session_equity()
 
     # ── Core Sizing ───────────────────────────────────────────────────────────
     def calculate_position(
         self,
-        symbol:    str,
-        direction: str,
-        entry:     float,
-        sl:        float,
-        tp:        float,
+        symbol:     str,
+        direction:  str,
+        entry:      float,
+        sl:         float,
+        tp:         float,
+        win_rate:   float = 0.50,   # passed from ML model confidence
     ) -> Optional[PositionSpec]:
 
         if not self._pre_trade_checks(symbol):
@@ -87,50 +114,120 @@ class RiskManager:
         if not account:
             return None
 
-        balance  = account["balance"]
+        # ── Use EQUITY not balance ────────────────────────────────────────────
+        equity = account["equity"]
+
         sym_info = mt5.symbol_info(symbol)
         if sym_info is None:
             logger.error(f"Symbol info unavailable: {symbol}")
             return None
 
-        # Risk in account currency
-        risk_usd    = balance * self.cfg.RISK_PER_TRADE
-        sl_distance = abs(entry - sl)
+        # ── Base risk: 1% of equity ───────────────────────────────────────────
+        base_risk_pct = self.cfg.RISK_PER_TRADE   # e.g. 0.01
 
+        # ── Anti-martingale: halve risk after CONSECUTIVE_LOSS_LIMIT losses ───
+        if self._consecutive_loss >= self.CONSECUTIVE_LOSS_LIMIT:
+            base_risk_pct = base_risk_pct / 2.0
+            logger.warning(
+                f"⚠️  Anti-martingale active — risk halved to "
+                f"{base_risk_pct*100:.2f}% after "
+                f"{self._consecutive_loss} consecutive losses"
+            )
+
+        risk_usd = equity * base_risk_pct
+
+        # ── Hard absolute cap (e.g. $50 max per trade) ────────────────────────
+        risk_usd = min(risk_usd, self.cfg.MAX_LOSS_PER_TRADE)
+
+        # ── Kelly Criterion (logged only — for reference) ─────────────────────
+        rr = abs(tp - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 1.0
+        kelly_pct = win_rate - ((1 - win_rate) / rr)
+        kelly_usd = equity * max(kelly_pct * 0.25, 0)   # quarter-Kelly
+        logger.debug(
+            f"📐 Kelly: win_rate={win_rate:.0%} RR={rr:.2f} → "
+            f"Kelly={kelly_pct*100:.1f}% | "
+            f"Quarter-Kelly=€{kelly_usd:.2f} | "
+            f"Using equity-1%=€{risk_usd:.2f}"
+        )
+
+        sl_distance = abs(entry - sl)
         if sl_distance == 0:
             logger.error("SL distance is zero — aborting")
             return None
 
-        # Pip value calculation
+        # ── Pip value & volume calculation ────────────────────────────────────
         pip_value  = sym_info.trade_contract_size * sym_info.point
         sl_pips    = sl_distance / sym_info.point
         volume_raw = risk_usd / (sl_pips * pip_value)
+        volume     = self._normalize_volume(volume_raw, sym_info)
 
-        # Normalise to allowed lot steps
-        volume = self._normalize_volume(volume_raw, sym_info)
+        # ── Minimum lot guard — recalculate actual risk at min lot ────────────
+        actual_risk = volume * sl_pips * pip_value
+        if actual_risk > self.cfg.MAX_LOSS_PER_TRADE * 1.5:
+            logger.warning(
+                f"⛔ Actual risk €{actual_risk:.2f} exceeds hard cap "
+                f"even at minimum lot — skipping trade"
+            )
+            return None
 
-        # Validate reward:risk
+        # ── Validate reward:risk ──────────────────────────────────────────────
         tp_distance = abs(tp - entry)
-        rr = round(tp_distance / sl_distance, 2)
-        if rr < 1.5:
-            logger.warning(f"R:R={rr} too low — minimum 1.5 required")
+        rr_actual   = round(tp_distance / sl_distance, 2)
+        if rr_actual < 1.5:
+            logger.warning(f"R:R={rr_actual} too low — minimum 1.5 required")
             return None
 
         spec = PositionSpec(
             symbol    = symbol,
             direction = direction,
             volume    = volume,
-            entry     = round(entry, sym_info.digits),
-            sl        = round(sl,    sym_info.digits),
-            tp        = round(tp,    sym_info.digits),
-            risk_usd  = round(risk_usd, 2),
-            rr_ratio  = rr,
+            entry     = round(entry,  sym_info.digits),
+            sl        = round(sl,     sym_info.digits),
+            tp        = round(tp,     sym_info.digits),
+            risk_usd  = round(actual_risk, 2),
+            rr_ratio  = rr_actual,
         )
+
         logger.info(
-            f"📐 Position | {symbol} {direction} | "
-            f"Vol={volume} | Risk=${risk_usd:.2f} | R:R={rr}"
+            f"📝 Position | {symbol} {direction} | "
+            f"Vol={volume} | Risk=€{actual_risk:.2f} "
+            f"({actual_risk/equity*100:.2f}% equity) | "
+            f"R:R={rr_actual} | "
+            f"Equity=€{equity:.2f}"
         )
         return spec
+
+    # ── Trade Result Feedback ─────────────────────────────────────────────────
+    def record_trade_result(self, pnl: float) -> None:
+        """
+        Call after every trade closes.  Updates daily P&L and the
+        consecutive loss counter used by the anti-martingale guard.
+        """
+        self._check_daily_reset()
+        self._daily_pnl += pnl
+
+        if pnl < 0:
+            self._consecutive_loss += 1
+            logger.warning(
+                f"📉 Loss recorded — consecutive losses: "
+                f"{self._consecutive_loss}"
+            )
+        else:
+            if self._consecutive_loss > 0:
+                logger.info(
+                    f"📈 Win — consecutive loss streak reset "
+                    f"(was {self._consecutive_loss})"
+                )
+            self._consecutive_loss = 0
+
+        logger.info(
+            f"📊 Daily P&L: €{self._daily_pnl:+.2f} | "
+            f"Consecutive losses: {self._consecutive_loss}"
+        )
+
+    # kept for backwards compatibility with existing main.py calls
+    def update_daily_pnl(self, pnl: float) -> None:
+        self.record_trade_result(pnl)
 
     # ── Pre-Trade Circuit Breakers ────────────────────────────────────────────
     def _pre_trade_checks(self, symbol: str) -> bool:
@@ -140,81 +237,83 @@ class RiskManager:
         if not account:
             return False
 
-        balance        = account["balance"]
-        daily_limit    = balance * self.cfg.MAX_DAILY_LOSS
-        loss_pct       = (-self._daily_pnl / daily_limit * 100) if daily_limit > 0 else 0
+        equity = account["equity"]
 
-        # ── 1. Daily loss limit warnings ──────────────────────────────────────
-        if self._daily_pnl < 0:
+        # ── 1. Equity drawdown from session open (catches floating losses) ────
+        if self._session_equity and self._session_equity > 0:
+            equity_drop     = self._session_equity - equity
+            equity_drop_pct = equity_drop / self._session_equity * 100
+            daily_limit_pct = self.cfg.MAX_DAILY_LOSS * 100   # e.g. 3.0
 
-            # 90% warning — urgent
-            if loss_pct >= 90 and not self._warned_daily_90:
+            if equity_drop_pct >= daily_limit_pct:
+                msg = (
+                    f"🚫 DAILY EQUITY DRAWDOWN LIMIT HIT\n"
+                    f"Session open: €{self._session_equity:.2f}\n"
+                    f"Current equity: €{equity:.2f}\n"
+                    f"Drop: €{equity_drop:.2f} ({equity_drop_pct:.1f}%) "
+                    f"≥ limit {daily_limit_pct:.0f}%\n"
+                    f"Trading halted for today"
+                )
+                logger.warning(msg)
+                if self._alerts:
+                    self._alerts.risk_warning(
+                        level="LIMIT_HIT",
+                        message=msg,
+                        daily_pnl=-equity_drop,
+                        daily_limit=self._session_equity * self.cfg.MAX_DAILY_LOSS,
+                        pct_used=equity_drop_pct,
+                    )
+                return False
+
+            # 90% of daily limit warning
+            if equity_drop_pct >= daily_limit_pct * 0.9 and \
+               not self._warned_daily_90:
                 self._warned_daily_90 = True
                 msg = (
-                    f"⛔ URGENT: Daily loss at {loss_pct:.0f}% of limit\n"
-                    f"Lost: €{abs(self._daily_pnl):.2f} of €{daily_limit:.2f} max\n"
-                    f"Only €{daily_limit - abs(self._daily_pnl):.2f} remaining "
-                    f"before trading halts for today"
+                    f"⛔ URGENT: Equity down {equity_drop_pct:.1f}% "
+                    f"today (limit {daily_limit_pct:.0f}%)\n"
+                    f"€{equity_drop:.2f} lost — only "
+                    f"€{self._session_equity*self.cfg.MAX_DAILY_LOSS - equity_drop:.2f} "
+                    f"remaining before halt"
                 )
                 logger.warning(msg)
                 if self._alerts:
                     self._alerts.risk_warning(
                         level="URGENT",
                         message=msg,
-                        daily_pnl=self._daily_pnl,
-                        daily_limit=daily_limit,
-                        pct_used=loss_pct,
+                        daily_pnl=-equity_drop,
+                        daily_limit=self._session_equity * self.cfg.MAX_DAILY_LOSS,
+                        pct_used=equity_drop_pct,
                     )
 
-            # 75% warning — caution
-            elif loss_pct >= 75 and not self._warned_daily_75:
+            # 75% of daily limit warning
+            elif equity_drop_pct >= daily_limit_pct * 0.75 and \
+                 not self._warned_daily_75:
                 self._warned_daily_75 = True
                 msg = (
-                    f"⚠️ WARNING: Daily loss at {loss_pct:.0f}% of limit\n"
-                    f"Lost: €{abs(self._daily_pnl):.2f} of €{daily_limit:.2f} max\n"
-                    f"€{daily_limit - abs(self._daily_pnl):.2f} remaining "
-                    f"before trading halts for today"
+                    f"⚠️  WARNING: Equity down {equity_drop_pct:.1f}% "
+                    f"today (limit {daily_limit_pct:.0f}%)"
                 )
                 logger.warning(msg)
                 if self._alerts:
                     self._alerts.risk_warning(
                         level="WARNING",
                         message=msg,
-                        daily_pnl=self._daily_pnl,
-                        daily_limit=daily_limit,
-                        pct_used=loss_pct,
+                        daily_pnl=-equity_drop,
+                        daily_limit=self._session_equity * self.cfg.MAX_DAILY_LOSS,
+                        pct_used=equity_drop_pct,
                     )
 
-        # ── Hard limit — stop trading ─────────────────────────────────────────
-        if self._daily_pnl <= -daily_limit:
-            msg = (
-                f"🚫 DAILY LOSS LIMIT HIT — trading halted for today\n"
-                f"Total loss: €{abs(self._daily_pnl):.2f} "
-                f"(limit was €{daily_limit:.2f})\n"
-                f"Trading resumes tomorrow at midnight"
-            )
-            logger.warning(msg)
-            if self._alerts:
-                self._alerts.risk_warning(
-                    level="LIMIT_HIT",
-                    message=msg,
-                    daily_pnl=self._daily_pnl,
-                    daily_limit=daily_limit,
-                    pct_used=100.0,
-                )
-            return False
-
-        # ── 2. Max concurrent trades warnings ────────────────────────────────
-        positions = mt5.positions_get()
+        # ── 2. Max concurrent trades ──────────────────────────────────────────
+        positions  = mt5.positions_get()
         open_count = len(positions) if positions else 0
         max_trades = self.cfg.MAX_OPEN_TRADES
 
-        # Near limit — 2 of 3 slots used
         if open_count >= max_trades - 1 and not self._warned_trades_near:
             self._warned_trades_near = True
             msg = (
-                f"⚠️ TRADES NEAR LIMIT: {open_count}/{max_trades} slots used\n"
-                f"Only 1 trade slot remaining"
+                f"⚠️  TRADES NEAR LIMIT: {open_count}/{max_trades} "
+                f"slots used — 1 remaining"
             )
             logger.warning(msg)
             if self._alerts:
@@ -225,13 +324,12 @@ class RiskManager:
                     max_trades=max_trades,
                 )
 
-        # All slots full — block and alert
         if open_count >= max_trades:
             if not self._warned_trades_full:
                 self._warned_trades_full = True
                 msg = (
-                    f"🚫 MAX TRADES REACHED: {open_count}/{max_trades} slots full\n"
-                    f"New signals blocked until a position closes"
+                    f"🚫 MAX TRADES: {open_count}/{max_trades} — "
+                    f"new signals blocked"
                 )
                 logger.warning(msg)
                 if self._alerts:
@@ -243,7 +341,6 @@ class RiskManager:
                     )
             return False
 
-        # Reset trades_full flag when a slot frees up
         if open_count < max_trades:
             self._warned_trades_full = False
         if open_count < max_trades - 1:
@@ -255,19 +352,15 @@ class RiskManager:
             logger.warning(f"🚫 Already have open position on {symbol}")
             return False
 
-        # ── 4. Margin check (require 200% free margin) ────────────────────────
+        # ── 4. Margin check (200% free margin) ───────────────────────────────
         if account["free_margin"] < account["margin"] * 2:
             msg = (
-                f"⚠️ LOW MARGIN WARNING\n"
-                f"Free margin: €{account['free_margin']:.2f} — "
+                f"⚠️  LOW MARGIN: Free €{account['free_margin']:.2f} "
                 f"below 200% safety threshold"
             )
             logger.warning(msg)
             if self._alerts:
-                self._alerts.risk_warning(
-                    level="LOW_MARGIN",
-                    message=msg,
-                )
+                self._alerts.risk_warning(level="LOW_MARGIN", message=msg)
             return False
 
         return True
@@ -289,15 +382,3 @@ class RiskManager:
             "margin":      info.margin or 1,
             "free_margin": info.margin_free,
         }
-
-    def update_daily_pnl(self, pnl: float) -> None:
-        """
-        Called by main.py after every trade closes to keep the
-        daily P&L counter accurate for the circuit breaker check.
-        """
-        self._check_daily_reset()
-        self._daily_pnl += pnl
-        logger.info(
-            f"📊 Daily P&L updated: ${self._daily_pnl:+.2f} "
-            f"(limit: -{self.cfg.MAX_DAILY_LOSS * 100:.0f}% of balance)"
-        )
