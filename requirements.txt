@@ -1,12 +1,51 @@
+# ── Core MT5 & Data ───────────────────────────────────────
 MetaTrader5>=5.0.0
 pandas>=1.3.0
 numpy>=1.21.0
-scikit-learn>=1.0.0
-matplotlib>=3.3.0
-schedule>=1.1.0
 pytz>=2021.1
-python-telegram-bot>=13.0
+
+# ── Technical Indicators ──────────────────────────────────
+pandas-ta>=0.3.14b
+
+# ── Machine Learning ──────────────────────────────────────
+scikit-learn>=1.0.0
+joblib>=1.1.0
+numba>=0.53.0
+
+# ── Scheduling & HTTP ─────────────────────────────────────
+schedule>=1.1.0
 requests>=2.25.0
+
+# ── Telegram ──────────────────────────────────────────────
+# FIX: python-telegram-bot is not used anywhere in the codebase.
+# All Telegram communication goes through raw requests calls in
+# notifications/telegram_alerts.py — no bot library needed.
+# Removed to avoid a large unnecessary dependency.
+
+# ── Web Scraping & RSS ────────────────────────────────────
 beautifulsoup4>=4.9.0
 lxml>=4.6.0
-numba>=0.53.0
+# FIX: feedparser was missing — used in calendar_scanner.py
+# and sentiment_analyzer.py for RSS feed parsing.
+feedparser>=6.0.0
+
+# ── Intermarket Data ──────────────────────────────────────
+# FIX: yfinance was missing — used in research/intermarket.py
+# to fetch DXY, VIX, SPX and GOLD data from Yahoo Finance.
+yfinance>=0.2.0
+
+# ── Sentiment Analysis ────────────────────────────────────
+# FIX: transformers and vaderSentiment were missing.
+# transformers is used for FinBERT in sentiment_analyzer.py.
+# vaderSentiment is the fallback engine when FinBERT is unavailable.
+transformers>=4.20.0
+torch>=1.13.0
+vaderSentiment>=3.3.2
+
+# ── Google Gemini (primary sentiment engine for EURUSD) ───
+# FIX: google-generativeai was missing — used in
+# sentiment_analyzer.py as the highest accuracy sentiment engine.
+google-generativeai>=0.4.0
+
+# ── Visualisation ─────────────────────────────────────────
+matplotlib>=3.3.0
