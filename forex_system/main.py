@@ -171,9 +171,9 @@ class ForexSystem:
         self.sentiment   = SentimentAnalyzer()
         self.intermarket = IntermarketAnalyzer()
         self.cot         = COTReader()
-                # Wire risk manager to alert system
-        self.risk_mgr.set_alerts(self.alerts)
 
+        # Wire risk manager to alert system
+        self.risk_mgr.set_alerts(self.alerts)
 
         self._start_keyboard_listener()
 
@@ -264,12 +264,8 @@ class ForexSystem:
 
     # ── session helpers ───────────────────────────────────────────────────────
     def _is_trading_session(self) -> bool:
-        """
-        FIX: original gate blocked scanning between 23:00–08:00 CET every night.
-        EURUSD trades 24/5 — only weekends should be blocked, not overnight hours.
-        """
         now = datetime.now(TIMEZONE)
-        if now.weekday() in (5, 6):  # 5=Saturday, 6=Sunday
+        if now.weekday() in (5, 6):
             logger.debug("Weekend — market closed, skipping scan.")
             return False
         return True
@@ -308,9 +304,6 @@ class ForexSystem:
             return
 
         # ── Candle guard ──────────────────────────────────────────────────────
-        # FIX: was calling mt5.copy_rates_from_pos() with raw tf integer,
-        # bypassing MT5_TIMEFRAME_MAP and silently returning None for
-        # timeframes like 16385 or 900. Now uses the mapped constant.
         tf_mapped = MT5_TIMEFRAME_MAP.get(tf, tf)
         rates     = mt5.copy_rates_from_pos(symbol, tf_mapped, 0, 1)
         if rates is not None and len(rates) > 0:
@@ -327,47 +320,127 @@ class ForexSystem:
         # ── Gate 2 — Technical ────────────────────────────────────────────────
         df_raw = self.connector.get_ohlcv(symbol, tf)
         if df_raw is None or df_raw.empty:
+            logger.debug("⛔ Gate 2 BLOCKED — no OHLCV data returned")
             return
         df = self.indicators.compute_all(df_raw)
         if df is None or df.empty:
-            return
-        signal = self.signal_eng.evaluate(df, symbol)
-        if not signal:
+            logger.debug("⛔ Gate 2 BLOCKED — indicators returned empty DataFrame")
             return
 
-        min_score = SCALPER_SIGNAL_SCORE if self.style == "scalper" else DAYTRADER_SIGNAL_SCORE
-        if hasattr(signal, "score") and signal.score < min_score:
-            logger.debug(f"Signal score too low: {signal.score:.2f} (min {min_score})")
+        signal = self.signal_eng.evaluate(df, symbol)
+        if not signal:
+            logger.debug("⛔ Gate 2 BLOCKED — signal score too low (no signal returned)")
             return
+
+        logger.debug(
+            f"✅ Gate 2 PASSED — {signal.signal.value} | "
+            f"Strength={signal.strength:.2f} | Conf={signal.confidence:.0%}"
+        )
 
         # ── Gate 3 — ML ───────────────────────────────────────────────────────
         ml           = self.ml_model.predict(df)
         ml_direction = ML_LABEL_MAP.get(ml["label"], str(ml["label"]))
-        if ml_direction != signal.signal.value or ml["confidence"] < CONFIG.ML_MIN_CONFIDENCE:
+
+        logger.debug(
+            f"🤖 ML prediction: {ml_direction} | "
+            f"Confidence: {ml['confidence']:.0%} | "
+            f"Required: {CONFIG.ML_MIN_CONFIDENCE:.0%} | "
+            f"Signal wants: {signal.signal.value} | "
+            f"HOLD={ml['probabilities']['HOLD']:.0%} "
+            f"BUY={ml['probabilities']['BUY']:.0%} "
+            f"SELL={ml['probabilities']['SELL']:.0%}"
+        )
+
+        if ml_direction != signal.signal.value:
+            logger.debug(
+                f"⛔ Gate 3 BLOCKED — ML disagrees: "
+                f"ML={ml_direction} vs Signal={signal.signal.value}"
+            )
             return
+        if ml["confidence"] < CONFIG.ML_MIN_CONFIDENCE:
+            logger.debug(
+                f"⛔ Gate 3 BLOCKED — ML confidence too low: "
+                f"{ml['confidence']:.0%} < {CONFIG.ML_MIN_CONFIDENCE:.0%}"
+            )
+            return
+
+        logger.debug(
+            f"✅ Gate 3 PASSED — ML={ml_direction} Conf={ml['confidence']:.0%}"
+        )
 
         # ── Gate 4 — Sentiment ────────────────────────────────────────────────
         sent = self.sentiment.get_symbol_sentiment(symbol)
-        if signal.signal.value == "BUY"  and sent["score"] < -0.1:
+        logger.debug(
+            f"📰 Sentiment: {sent['label']} | "
+            f"Score: {sent['score']:+.3f} | "
+            f"Conf: {sent['confidence']:.0%} | "
+            f"Engine: {sent['engine']}"
+        )
+
+        if signal.signal.value == "BUY" and sent["score"] < -0.1:
+            logger.debug(
+                f"⛔ Gate 4 BLOCKED — Sentiment bearish "
+                f"({sent['score']:+.3f}) conflicts with BUY signal"
+            )
             return
-        if signal.signal.value == "SELL" and sent["score"] >  0.1:
+        if signal.signal.value == "SELL" and sent["score"] > 0.1:
+            logger.debug(
+                f"⛔ Gate 4 BLOCKED — Sentiment bullish "
+                f"({sent['score']:+.3f}) conflicts with SELL signal"
+            )
             return
+
+        logger.debug(
+            f"✅ Gate 4 PASSED — Sentiment {sent['label']} ({sent['score']:+.3f})"
+        )
 
         # ── Gate 5 — Intermarket ──────────────────────────────────────────────
         inter = self.intermarket.get_intermarket_signal(symbol)
-        if signal.signal.value == "BUY"  and inter["score"] < -0.1:
+        logger.debug(
+            f"🌐 Intermarket score: {inter['score']:+.3f}"
+        )
+
+        if signal.signal.value == "BUY" and inter["score"] < -0.1:
+            logger.debug(
+                f"⛔ Gate 5 BLOCKED — Intermarket bearish "
+                f"({inter['score']:+.3f}) conflicts with BUY signal"
+            )
             return
-        if signal.signal.value == "SELL" and inter["score"] >  0.1:
+        if signal.signal.value == "SELL" and inter["score"] > 0.1:
+            logger.debug(
+                f"⛔ Gate 5 BLOCKED — Intermarket bullish "
+                f"({inter['score']:+.3f}) conflicts with SELL signal"
+            )
             return
+
+        logger.debug(
+            f"✅ Gate 5 PASSED — Intermarket score={inter['score']:+.3f}"
+        )
 
         # ── Gate 6 — COT ──────────────────────────────────────────────────────
         cot = self.cot.get_cot_signal(symbol)
-        if signal.signal.value == "BUY"  and cot["bias"] == "Bearish":
+        logger.debug(
+            f"📊 COT bias: {cot['bias']}"
+        )
+
+        if signal.signal.value == "BUY" and cot["bias"] == "Bearish":
+            logger.debug(
+                f"⛔ Gate 6 BLOCKED — COT bias Bearish conflicts with BUY signal"
+            )
             return
         if signal.signal.value == "SELL" and cot["bias"] == "Bullish":
+            logger.debug(
+                f"⛔ Gate 6 BLOCKED — COT bias Bullish conflicts with SELL signal"
+            )
             return
 
+        logger.debug(f"✅ Gate 6 PASSED — COT bias={cot['bias']}")
+
         # ── All gates passed — fire alert ─────────────────────────────────────
+        logger.info(
+            f"🚀 ALL GATES PASSED — firing {signal.signal.value} alert on {symbol}"
+        )
+
         direction = signal.signal.value
         common = dict(
             symbol=symbol, entry=signal.entry, sl=signal.sl, tp=signal.tp,
