@@ -1,5 +1,6 @@
 # research/sentiment_analyzer.py
 import feedparser
+import json
 import re
 import time
 from datetime import datetime
@@ -7,7 +8,7 @@ from monitoring.logger import get_logger
 
 logger = get_logger("SentimentAnalyzer")
 
-# ── RSS News Sources ──────────────────────────────────────────
+# ── RSS News Sources ──────────────────────────────────────────────────────────
 RSS_FEEDS = {
     "fed":        "https://www.federalreserve.gov/feeds/press_all.xml",
     "ecb":        "https://www.ecb.europa.eu/rss/press.html",
@@ -21,8 +22,7 @@ RSS_FEEDS = {
     "cnbc_fx":    "https://www.cnbc.com/id/20910258/device/rss/rss.html",
 }
 
-# ── Currency-Specific Keywords ────────────────────────────────
-# Each symbol has UNIQUE keywords so articles don't bleed across pairs
+# ── Currency-Specific Keywords ────────────────────────────────────────────────
 CURRENCY_KEYWORDS = {
     "EURUSD": ["euro", "EUR", "ECB", "lagarde", "european central bank",
                "eurozone", "eur/usd", "eurodollar"],
@@ -38,11 +38,26 @@ CURRENCY_KEYWORDS = {
                "gold price", "safe haven"],
 }
 
+# Neutral fallback returned when all engines fail
+_NEUTRAL_RESULT = {
+    "score":      0.0,
+    "label":      "Neutral",
+    "confidence": 0.0,
+    "engine":     "None",
+    "articles":   0,
+}
+
+# Cache TTL in seconds (30 minutes)
+CACHE_TTL_SECS = 1800
+
+# Minimum articles required before trusting a sentiment score
+MIN_ARTICLES = 3
+
 
 class SentimentAnalyzer:
     """
     Hybrid sentiment engine: Gemini (EURUSD only) → FinBERT → VADER.
-    BUG FIX: Each symbol now fetches articles using its OWN keywords only,
+    Each symbol fetches articles using its OWN keywords only,
     preventing identical scores across all pairs.
     """
 
@@ -50,14 +65,14 @@ class SentimentAnalyzer:
         self._gemini       = None
         self._finbert_pipe = None
         self._vader        = None
-        self._cache        = {}
-        self._cache_time   = {}
+        self._cache:       dict = {}
+        self._cache_time:  dict = {}
         self._load_gemini()
         self._load_finbert()
 
-    # ── Engine Loading ────────────────────────────────────────
+    # ── Engine Loading ────────────────────────────────────────────────────────
 
-    def _load_gemini(self):                                        # ← 4-space indent — inside class
+    def _load_gemini(self) -> None:
         try:
             from config.settings import GEMINI_ENABLED, GEMINI_API_KEY
             if not GEMINI_ENABLED:
@@ -76,7 +91,7 @@ class SentimentAnalyzer:
         except Exception as e:
             logger.warning(f"Gemini load failed: {e} — using FinBERT")
 
-    def _load_finbert(self):
+    def _load_finbert(self) -> None:
         try:
             logger.info("🧠 Loading FinBERT (~88% accuracy)…")
             from transformers import pipeline
@@ -89,7 +104,7 @@ class SentimentAnalyzer:
         except Exception as e:
             logger.warning(f"FinBERT not available: {e} — will use VADER")
 
-    def _load_vader(self):
+    def _load_vader(self) -> None:
         if self._vader:
             return
         try:
@@ -98,21 +113,28 @@ class SentimentAnalyzer:
         except Exception as e:
             logger.error(f"VADER not available: {e}")
 
-    # ── Article Fetching ──────────────────────────────────────
+    # ── Article Fetching ──────────────────────────────────────────────────────
 
     def _fetch_articles(self, symbol: str) -> list:
         """
         Fetch up to 20 articles for a symbol using ONLY that symbol's
-        keywords. This prevents all pairs returning the same USD/Fed articles.
+        keywords, sampling evenly across all feeds before hitting the cap.
+
+        FIX: old inner-loop break fired as soon as any single feed produced
+        20 articles, leaving all remaining feeds unsampled. New approach
+        collects up to 5 articles per feed first, then fills to 20 from
+        whatever feeds had more, ensuring broad source coverage.
         """
         kw = CURRENCY_KEYWORDS.get(symbol, [])
         if not kw:
             logger.warning(f"No keywords defined for {symbol}")
             return []
 
-        articles = []
+        per_feed:   list = []     # list of lists, one per feed
+        total_found: int = 0
 
         for src, url in RSS_FEEDS.items():
+            feed_articles: list = []
             try:
                 feed = feedparser.parse(url)
                 for entry in feed.entries[:25]:
@@ -120,31 +142,52 @@ class SentimentAnalyzer:
                     summary = entry.get("summary", "")
                     txt     = f"{title} {summary}".lower()
 
-                    # Only match this symbol's own keywords
                     if any(k.lower() in txt for k in kw):
-                        articles.append({
+                        feed_articles.append({
                             "title":   title,
                             "summary": summary[:300],
                             "source":  src,
                         })
+            except Exception:
+                pass    # silently skip dead feeds
 
+            per_feed.append(feed_articles)
+            total_found += len(feed_articles)
+
+        # Round-robin merge across feeds up to 20 articles total
+        # so no single feed monopolises the sample
+        articles: list = []
+        idx = 0
+        while len(articles) < 20 and any(per_feed):
+            for feed_list in per_feed:
+                if idx < len(feed_list):
+                    articles.append(feed_list[idx])
                     if len(articles) >= 20:
                         break
-
-            except Exception:
-                continue  # silently skip dead feeds
-
-            if len(articles) >= 20:
+            idx += 1
+            if idx > max((len(f) for f in per_feed), default=0):
                 break
 
-        logger.debug(f"📰 {symbol}: {len(articles)} articles found across RSS feeds")
-        return articles[:20]
+        logger.debug(
+            f"📰 {symbol}: {len(articles)} articles sampled "
+            f"({total_found} total matches across {len(RSS_FEEDS)} feeds)"
+        )
+        return articles
 
-    # ── Scoring Engines ───────────────────────────────────────
+    # ── Scoring Engines ───────────────────────────────────────────────────────
 
     def _score_gemini(self, articles: list, symbol: str) -> dict | None:
         if not self._gemini or not articles:
             return None
+
+        # Require a minimum number of articles before trusting Gemini's score
+        if len(articles) < MIN_ARTICLES:
+            logger.debug(
+                f"Gemini skipped for {symbol} — only {len(articles)} articles "
+                f"(minimum {MIN_ARTICLES})"
+            )
+            return None
+
         headlines = "\n".join(f"- {a['title']}" for a in articles[:10])
         prompt = (
             f"You are a professional forex trader analyzing market sentiment.\n\n"
@@ -156,25 +199,43 @@ class SentimentAnalyzer:
         )
         try:
             resp  = self._gemini.generate_content(prompt)
-            match = re.search(r"\{.*\}", resp.text, re.DOTALL)
-            if match:
-                import json
-                data = json.loads(match.group())
-                return {
-                    "score":      float(data.get("score", 0)),
-                    "label":      data.get("label", "Neutral"),
-                    "confidence": float(data.get("confidence", 0.7)),
-                    "reasoning":  data.get("reasoning", ""),
-                    "engine":     "Gemini",
-                    "articles":   len(articles),
-                }
+            match = re.search(r"\{.*?\}", resp.text, re.DOTALL)
+            if not match:
+                logger.warning("Gemini response contained no JSON object")
+                return None
+
+            data = json.loads(match.group())
+
+            score      = float(data.get("score",      0.0))
+            confidence = float(data.get("confidence", 0.0))
+            label      = data.get("label", "Neutral")
+
+            # FIX: reject low-confidence Gemini results rather than returning
+            # a bogus 0.7 default confidence that blocks legitimate trades
+            if confidence < 0.5:
+                logger.debug(
+                    f"Gemini result for {symbol} rejected — "
+                    f"confidence {confidence:.2f} below 0.5 threshold"
+                )
+                return None
+
+            return {
+                "score":      round(score, 4),
+                "label":      label,
+                "confidence": round(confidence, 4),
+                "reasoning":  data.get("reasoning", ""),
+                "engine":     "Gemini",
+                "articles":   len(articles),
+            }
+
         except Exception as e:
             err = str(e)
             if "429" in err or "quota" in err.lower() or "rate" in err.lower():
                 logger.warning(
-                    "⚠️ Gemini quota hit — disabling for this session, switching to FinBERT"
+                    "⚠️ Gemini quota hit — disabling for this session, "
+                    "switching to FinBERT"
                 )
-                self._gemini = None  # stop retrying this session
+                self._gemini = None
             else:
                 logger.warning(f"Gemini scoring failed: {e}")
         return None
@@ -183,14 +244,21 @@ class SentimentAnalyzer:
         if not self._finbert_pipe or not articles:
             return None
         try:
-            scores = []
+            scores: list = []
             for art in articles[:15]:
-                result = self._finbert_pipe(art["title"][:512])[0]
+                # FIX: ensure we always pass a single string, not a list,
+                # to the pipeline so [0] indexing is always valid
+                title  = str(art["title"])[:512]
+                result = self._finbert_pipe(title)[0]   # list of label dicts
                 best   = max(result, key=lambda x: x["score"])
-                val    = {"positive": 1, "negative": -1, "neutral": 0}.get(
-                    best["label"].lower(), 0
+                val    = (
+                    {"positive": 1, "negative": -1, "neutral": 0}
+                    .get(best["label"].lower(), 0)
                 ) * best["score"]
                 scores.append(val)
+
+            if not scores:
+                return None
 
             avg   = sum(scores) / len(scores)
             label = "Bullish" if avg > 0.1 else "Bearish" if avg < -0.1 else "Neutral"
@@ -206,18 +274,17 @@ class SentimentAnalyzer:
         return None
 
     def _score_vader(self, articles: list) -> dict:
+        """Always returns a dict — last-resort fallback, never returns None."""
         self._load_vader()
         if not self._vader or not articles:
-            return {
-                "score": 0, "label": "Neutral",
-                "confidence": 0, "engine": "None", "articles": 0,
-            }
+            return dict(_NEUTRAL_RESULT)
+
         try:
             comps = [
-                self._vader.polarity_scores(a["title"])["compound"]
+                self._vader.polarity_scores(str(a["title"]))["compound"]
                 for a in articles
             ]
-            avg   = sum(comps) / len(comps) if comps else 0
+            avg   = sum(comps) / len(comps) if comps else 0.0
             label = "Bullish" if avg > 0.05 else "Bearish" if avg < -0.05 else "Neutral"
             return {
                 "score":      round(avg, 4),
@@ -228,26 +295,28 @@ class SentimentAnalyzer:
             }
         except Exception as e:
             logger.error(f"VADER failed: {e}")
-            return {
-                "score": 0, "label": "Neutral",
-                "confidence": 0, "engine": "None", "articles": 0,
-            }
+            return dict(_NEUTRAL_RESULT)
 
-    # ── Main Public Method ────────────────────────────────────
+    # ── Main Public Method ────────────────────────────────────────────────────
 
     def get_symbol_sentiment(self, symbol: str) -> dict:
-        """Return sentiment dict for a symbol. Cached for 30 min."""
+        """Return sentiment dict for a symbol. Cached for 30 minutes."""
         now = datetime.now()
+
+        # FIX: was using .seconds which returns only the seconds *component*
+        # of the timedelta. A 2-hour-old cache entry shows .seconds == 0 and
+        # appears valid indefinitely. total_seconds() returns full elapsed time.
         if (
             symbol in self._cache
             and symbol in self._cache_time
-            and (now - self._cache_time[symbol]).seconds < 1800
+            and (now - self._cache_time[symbol]).total_seconds() < CACHE_TTL_SECS
         ):
+            logger.debug(f"📰 {symbol} sentiment served from cache")
             return self._cache[symbol]
 
         articles = self._fetch_articles(symbol)
 
-        # Gemini only for EURUSD (preserves free-tier quota)
+        # Gemini only for EURUSD — preserves free-tier API quota
         if symbol == "EURUSD" and self._gemini:
             result = (
                 self._score_gemini(articles, symbol)
@@ -260,19 +329,30 @@ class SentimentAnalyzer:
                 or self._score_vader(articles)
             )
 
+        # FIX: final safety net — if the entire chain somehow returns None
+        # (all engines unavailable), use the neutral fallback so result.get()
+        # on the next line never raises AttributeError.
+        if result is None:
+            logger.warning(
+                f"All sentiment engines failed for {symbol} — "
+                f"returning neutral fallback"
+            )
+            result = dict(_NEUTRAL_RESULT)
+            result["articles"] = len(articles)
+
         logger.info(
             f"📰 {symbol} Sentiment [{result.get('engine')}]: "
-            f"{result.get('label')} ({result.get('score'):+.3f}) | "
-            f"{result.get('articles')} articles"
+            f"{result.get('label')} ({result.get('score', 0):+.3f}) | "
+            f"{result.get('articles', 0)} articles"
         )
 
         self._cache[symbol]      = result
         self._cache_time[symbol] = now
         return result
 
-    # ── Print Table ───────────────────────────────────────────
+    # ── Print Table ───────────────────────────────────────────────────────────
 
-    def print_sentiment_table(self):
+    def print_sentiment_table(self) -> None:
         from config.settings import CONFIG
         engine_label = (
             "🤖 Gemini (~92%) for EURUSD | 🧠 FinBERT (~88%) for others"
@@ -283,8 +363,8 @@ class SentimentAnalyzer:
                 else "📊 VADER (~65% accuracy)"
             )
         )
-        print(f"\n📰 MARKET SENTIMENT\n{'='*65}")
-        print(f"  {engine_label}\n{'='*65}")
+        print(f"\n📰 MARKET SENTIMENT\n{'=' * 65}")
+        print(f"  {engine_label}\n{'=' * 65}")
         for sym in CONFIG.SYMBOLS:
             r    = self.get_symbol_sentiment(sym)
             icon = (

@@ -1,6 +1,9 @@
-# main.py — GODBOT v3.0
+# main.py – GODBOT v3.0
 import os
-os.environ["NUMBA_CACHE_DIR"] = r"C:\Users\micha\.numba_cache"
+import tempfile
+
+# ── Portable Numba cache ──────────────────────────────────────────────────────
+os.environ["NUMBA_CACHE_DIR"] = os.path.join(tempfile.gettempdir(), ".numba_cache")
 
 import time
 import json
@@ -14,19 +17,19 @@ import MetaTrader5 as mt5
 from datetime import datetime
 from typing import Optional
 
-from core.mt5_connector      import MT5Connector
-from core.indicators         import IndicatorEngine
-from signals.signal_engine   import SignalEngine
-from signals.ml_model        import MLSignalModel
-from risk.risk_manager       import RiskManager
-from execution.order_executor import OrderExecutor
-from monitoring.logger       import get_logger
-from monitoring.dashboard    import Dashboard
+from core.mt5_connector       import MT5Connector, MT5_TIMEFRAME_MAP
+from core.indicators          import IndicatorEngine
+from signals.signal_engine    import SignalEngine
+from signals.ml_model         import MLSignalModel
+from risk.risk_manager        import RiskManager
+from execution.order_executor  import OrderExecutor
+from monitoring.logger        import get_logger
+from monitoring.dashboard     import Dashboard
 from notifications.alert_manager import AlertManager
-from research.calendar_scanner  import CalendarScanner
+from research.calendar_scanner   import CalendarScanner
 from research.sentiment_analyzer import SentimentAnalyzer
-from research.intermarket     import IntermarketAnalyzer
-from research.cot_reader      import COTReader
+from research.intermarket        import IntermarketAnalyzer
+from research.cot_reader         import COTReader
 from config.settings import (
     CONFIG,
     PROFILE_FILE,
@@ -48,9 +51,9 @@ TIMEZONE = pytz.timezone(TRADER_TIMEZONE)
 ML_LABEL_MAP = {0: "HOLD", 1: "BUY", 2: "SELL"}
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 #  Profile persistence
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 class ProfileManager:
     DEFAULT = {"style": "scalper", "mode": "1", "name": TRADER_NAME}
 
@@ -73,9 +76,9 @@ class ProfileManager:
             logger.error(f"Profile save error: {e}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 #  Interactive startup menu
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 class StartupMenu:
     STYLES = {"1": "scalper", "2": "daytrader"}
     MODES  = {"1": "Signal Only", "2": "Semi Automated", "3": "Fully Automated"}
@@ -142,9 +145,9 @@ class StartupMenu:
             print(f"  ⚠️  Please enter: {' or '.join(choices)}")
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 #  Core system
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 class ForexSystem:
     MODE_NAMES = {"1": "Signal Only", "2": "Semi Automated", "3": "Fully Automated"}
 
@@ -154,10 +157,6 @@ class ForexSystem:
         self.mode     = profile["mode"]
         self._running = False
         self._paused  = False
-
-        # Candle guard — tracks the last processed candle time per symbol
-        # so heavy computation (indicators + ML) only fires on a NEW candle,
-        # even though the scan loop runs every 10 s.
         self._last_candle_time: dict = {}
 
         self.connector   = MT5Connector()
@@ -172,6 +171,9 @@ class ForexSystem:
         self.sentiment   = SentimentAnalyzer()
         self.intermarket = IntermarketAnalyzer()
         self.cot         = COTReader()
+                # Wire risk manager to alert system
+        self.risk_mgr.set_alerts(self.alerts)
+
 
         self._start_keyboard_listener()
 
@@ -262,8 +264,15 @@ class ForexSystem:
 
     # ── session helpers ───────────────────────────────────────────────────────
     def _is_trading_session(self) -> bool:
-        hour = datetime.now(TIMEZONE).hour
-        return LONDON_OPEN_CET <= hour < NY_CLOSE_CET
+        """
+        FIX: original gate blocked scanning between 23:00–08:00 CET every night.
+        EURUSD trades 24/5 — only weekends should be blocked, not overnight hours.
+        """
+        now = datetime.now(TIMEZONE)
+        if now.weekday() in (5, 6):  # 5=Saturday, 6=Sunday
+            logger.debug("Weekend — market closed, skipping scan.")
+            return False
+        return True
 
     def _is_overlap_session(self) -> bool:
         hour = datetime.now(TIMEZONE).hour
@@ -272,7 +281,6 @@ class ForexSystem:
     # ── scanning ──────────────────────────────────────────────────────────────
     def _scan_markets(self) -> None:
         if not self._is_trading_session():
-            logger.debug("Outside trading session — skipping scan.")
             return
         self._process_eurusd()
 
@@ -280,7 +288,7 @@ class ForexSystem:
         symbol = "EURUSD"
         tf     = SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY
 
-        # ── Spread gate (runs every scan — cheap, catches spikes fast) ────────
+        # ── Spread gate ───────────────────────────────────────────────────────
         tick     = mt5.symbol_info_tick(symbol)
         sym_info = mt5.symbol_info(symbol)
         if tick and sym_info:
@@ -290,29 +298,33 @@ class ForexSystem:
                 logger.debug(f"Spread too wide: {spread:.1f} pips (max {max_sp})")
                 return
 
-        # ── Gate 1 — Calendar (runs every scan — cheap) ───────────────────────
-        safety = self.calendar.is_safe_to_trade(symbol, minutes_before=30, minutes_after=15)
+        # ── Gate 1 — Calendar ─────────────────────────────────────────────────
+        safety = self.calendar.is_safe_to_trade(
+            symbol, minutes_before=30, minutes_after=15
+        )
         if not safety["safe"]:
             evt = safety["events"][0]
             logger.debug(f"News block: {evt['event']} in {evt['minutes']} mins")
             return
 
-        # ── Candle guard — skip heavy work if candle hasn't closed yet ─────────
-        # Fetches only the single most-recent bar to read its open timestamp.
-        # Cost: one tiny MT5 call (~0.5 ms). Saves: full indicator + ML run.
-        rates = mt5.copy_rates_from_pos(symbol, tf, 0, 1)
+        # ── Candle guard ──────────────────────────────────────────────────────
+        # FIX: was calling mt5.copy_rates_from_pos() with raw tf integer,
+        # bypassing MT5_TIMEFRAME_MAP and silently returning None for
+        # timeframes like 16385 or 900. Now uses the mapped constant.
+        tf_mapped = MT5_TIMEFRAME_MAP.get(tf, tf)
+        rates     = mt5.copy_rates_from_pos(symbol, tf_mapped, 0, 1)
         if rates is not None and len(rates) > 0:
-            candle_time = rates[0]["time"]          # UNIX timestamp of candle open
+            candle_time = rates[0]["time"]
             if self._last_candle_time.get(symbol) == candle_time:
                 logger.debug(f"Same candle ({symbol}) — skipping heavy computation.")
-                return                              # nothing new to evaluate
+                return
             self._last_candle_time[symbol] = candle_time
             logger.debug(
                 f"New candle detected ({symbol}) @ "
                 f"{datetime.utcfromtimestamp(candle_time).strftime('%H:%M:%S')} UTC"
             )
 
-        # ── Gate 2 — Technical (only runs on new candle) ──────────────────────
+        # ── Gate 2 — Technical ────────────────────────────────────────────────
         df_raw = self.connector.get_ohlcv(symbol, tf)
         if df_raw is None or df_raw.empty:
             return
@@ -387,20 +399,32 @@ class ForexSystem:
                 return
 
         # ── Modes 2 & 3 — place order ─────────────────────────────────────────
-        lot = self.risk_mgr.calculate_lot_size(
+        spec = self.risk_mgr.calculate_position(
             symbol=symbol,
-            sl_pips=SCALPER_SL_PIPS if self.style == "scalper" else DAYTRADER_SL_PIPS,
+            direction=direction,
+            entry=signal.entry,
+            sl=signal.sl,
+            tp=signal.tp,
         )
-        result = self.executor.send_market_order(
-            symbol=symbol, direction=direction, lot=lot,
-            sl=signal.sl, tp=signal.tp, magic=CONFIG.MAGIC_NUMBER,
-        )
+        if spec is None:
+            logger.warning(f"⚠️ Position sizing rejected for {symbol} — skipping trade")
+            return
+
+        result = self.executor.send_market_order(spec)
         if result:
             self.alerts.trade_opened(
-                symbol=symbol, direction=direction, lot=lot,
-                entry=signal.entry, sl=signal.sl, tp=signal.tp,
+                symbol=symbol,
+                direction=direction,
+                ticket=result["ticket"],
+                entry=result["price"],
+                sl=spec.sl,
+                tp=spec.tp,
+                volume=spec.volume,
+                risk=spec.risk_usd,
+                style=self.style,
+                mode=self.MODE_NAMES[self.mode],
             )
-            logger.info(f"✅ Order placed: {direction} {symbol} lot={lot:.2f}")
+            logger.info(f"✅ Order placed: {direction} {symbol} lot={spec.volume:.2f}")
         else:
             logger.warning(f"❌ Order failed: {symbol} {direction}")
 
@@ -415,7 +439,6 @@ class ForexSystem:
             ticket    = pos.ticket
             direction = "BUY" if pos.type == 0 else "SELL"
             entry     = pos.price_open
-            lot       = pos.volume
             pnl       = pos.profit
             sl        = pos.sl
             tp        = pos.tp
@@ -431,7 +454,7 @@ class ForexSystem:
 
             pips_to_sl = abs(current - sl) / point / 10 if sl else 999
 
-            # Danger check
+            # ── Danger check ──────────────────────────────────────────────────
             danger_reasons: list = []
             if pips_to_sl <= 5:
                 danger_reasons.append(f"SL very close ({pips_to_sl:.1f} pips)")
@@ -452,22 +475,37 @@ class ForexSystem:
                 if self.mode == "3":
                     result = self.executor.close_position(ticket)
                     if result:
+                        pips = (current - entry) / point / 10
+                        if direction == "SELL":
+                            pips = -pips
                         self.alerts.trade_closed(
-                            symbol=symbol, direction=direction, ticket=ticket,
-                            entry=entry, close_price=current, pnl=pnl, lot=lot,
+                            symbol=symbol,
+                            direction=direction,
+                            ticket=ticket,
+                            entry=entry,
+                            close=current,
+                            pnl=pnl,
+                            pips=round(pips, 1),
+                            reason="Danger exit",
                         )
                         self.dashboard.log_trade(
                             symbol=symbol, direction=direction,
                             pnl=pnl, ticket=ticket,
                         )
 
-            # TP proximity alert
+            # ── TP proximity alert ────────────────────────────────────────────
             if tp:
                 pips_to_tp = abs(current - tp) / point / 10
                 if pips_to_tp <= 3:
                     self.alerts.potential_exit(
-                        symbol=symbol, direction=direction, ticket=ticket,
-                        entry=entry, current=current, pnl=pnl, tp=tp,
+                        symbol=symbol,
+                        direction=direction,
+                        ticket=ticket,
+                        entry=entry,
+                        current=current,
+                        pnl=pnl,
+                        tp=tp,
+                        reasons=[f"Price within {pips_to_tp:.1f} pips of TP"],
                     )
 
     # ── trailing stops ────────────────────────────────────────────────────────
@@ -477,11 +515,14 @@ class ForexSystem:
         positions = mt5.positions_get(magic=CONFIG.MAGIC_NUMBER)
         if not positions:
             return
+
+        trail_points = int(getattr(CONFIG, "TRAILING_STOP_PIPS", 15) * 10)
         for pos in positions:
             try:
                 self.executor.modify_trailing_stop(
                     ticket=pos.ticket,
-                    trail_pips=CONFIG.TRAILING_STOP_PIPS,
+                    symbol=pos.symbol,
+                    trail_points=trail_points,
                 )
             except Exception as e:
                 logger.debug(f"Trailing stop error for {pos.ticket}: {e}")
@@ -505,16 +546,24 @@ class ForexSystem:
 
             result = self.executor.close_position(ticket)
             if result:
+                sym_info = mt5.symbol_info(symbol)
+                point    = sym_info.point if sym_info else 0.00001
+                pips     = (close_px - pos.price_open) / point / 10
+                if direction == "SELL":
+                    pips = -pips
                 self.alerts.trade_closed(
-                    symbol=symbol, direction=direction, ticket=ticket,
-                    entry=pos.price_open, close_price=close_px,
-                    pnl=pnl, lot=pos.volume,
+                    symbol=symbol,
+                    direction=direction,
+                    ticket=ticket,
+                    entry=pos.price_open,
+                    close=close_px,
+                    pnl=pnl,
+                    pips=round(pips, 1),
+                    reason="EOD close",
                 )
                 self.dashboard.log_trade(
-                    symbol=pos.symbol,
-                    direction=direction,
-                    pnl=pnl,
-                    ticket=ticket,
+                    symbol=symbol, direction=direction,
+                    pnl=pnl, ticket=ticket,
                 )
                 logger.info(f"  ✅ Closed {symbol} ticket={ticket}  pnl={pnl:.2f}")
             else:
@@ -526,19 +575,26 @@ class ForexSystem:
 
         logger.info("=" * 50)
         logger.info("📊  DAILY SUMMARY")
-        logger.info(f"   Signals   : {stats.get('total_signals',  0)}")
-        logger.info(f"   Trades    : {stats.get('total_trades',   0)}")
-        logger.info(f"   Winning   : {stats.get('winning_trades', 0)}")
-        logger.info(f"   Win rate  : {stats.get('win_rate',       0.0):.1f}%")
-        logger.info(f"   Total P&L : ${stats.get('total_pnl',    0.0):+.2f}")
+        logger.info(f"   Signals   : {stats.get('signals',      0)}")
+        logger.info(f"   Trades    : {stats.get('trades',       0)}")
+        logger.info(f"   Winning   : {stats.get('winners',      0)}")
+        logger.info(f"   Win rate  : {stats.get('win_rate',     0.0):.1f}%")
+        logger.info(f"   Net P&L   : ${stats.get('net_pnl',    0.0):+.2f}")
+        logger.info(f"   Best      : ${stats.get('best_trade',  0.0):+.2f}")
+        logger.info(f"   Worst     : ${stats.get('worst_trade', 0.0):+.2f}")
         logger.info("=" * 50)
 
         self.alerts.daily_summary(
-            trades=stats.get("total_trades",   0),
-            winning=stats.get("winning_trades", 0),
-            total_pnl=stats.get("total_pnl",   0.0),
-            win_rate=stats.get("win_rate",      0.0),
-            signals=stats.get("total_signals",  0),
+            trades=stats.get("trades",        0),
+            winners=stats.get("winners",      0),
+            losers=stats.get("losers",        0),
+            net_pnl=stats.get("net_pnl",     0.0),
+            win_rate=stats.get("win_rate",   0.0),
+            signals=stats.get("signals",      0),
+            best_trade=stats.get("best_trade",   0.0),
+            worst_trade=stats.get("worst_trade", 0.0),
+            gross_profit=stats.get("gross_profit", 0.0),
+            gross_loss=stats.get("gross_loss",     0.0),
         )
         try:
             self.dashboard.export_report()
@@ -591,9 +647,9 @@ class ForexSystem:
         sys.exit(0)
 
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 #  Entry point
-# ──────────────────────────────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     menu    = StartupMenu()
     profile = menu.run()

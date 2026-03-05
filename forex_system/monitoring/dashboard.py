@@ -3,6 +3,7 @@ import MetaTrader5 as mt5
 import pandas as pd
 import json
 import os
+import time
 from datetime import datetime
 from typing import List
 from config.settings import CONFIG
@@ -20,22 +21,23 @@ class Dashboard:
     """
 
     def __init__(self, config=CONFIG):
-        self.cfg          = config
+        self.cfg              = config
         self.signals_log: List[dict] = []
         self.trades_log:  List[dict] = []
-        self._scan_secs   = 60          # updated by main.py
+        self._scan_secs           = 60
+        self._last_scan_time      = None
+        self._scan_status         = "Waiting"
+        self._display_initialized = False
         os.makedirs("reports", exist_ok=True)
-        self._load_today()              # restore today's data
+        self._load_today()
 
-    # ── Scan interval (set by main.py after style known) ──
-    def set_scan_secs(self, secs: int):
+    # ── Scan interval ─────────────────────────────────────────────────────────
+    def set_scan_secs(self, secs: int) -> None:
         self._scan_secs = secs
 
-    # ── Persistence ───────────────────────────────────────
-    def _load_today(self):
-        """Loads today's signals and trades from disk."""
+    # ── Persistence ───────────────────────────────────────────────────────────
+    def _load_today(self) -> None:
         today = datetime.now().strftime("%Y-%m-%d")
-
         for attr, path in [
             ("signals_log", "reports/signals_log.json"),
             ("trades_log",  "reports/trades_log.json"),
@@ -44,18 +46,15 @@ class Dashboard:
                 if os.path.exists(path):
                     with open(path, "r") as f:
                         all_entries = json.load(f)
-                    # Keep only today's entries
                     setattr(
                         self, attr,
-                        [e for e in all_entries
-                         if e.get("date") == today]
+                        [e for e in all_entries if e.get("date") == today],
                     )
             except Exception as e:
                 logger.debug(f"Load {attr} error: {e}")
                 setattr(self, attr, [])
 
-    def _save_logs(self):
-        """Persists signals and trades to disk."""
+    def _save_logs(self) -> None:
         try:
             with open("reports/signals_log.json", "w") as f:
                 json.dump(self.signals_log, f, indent=2)
@@ -64,9 +63,8 @@ class Dashboard:
         except Exception as e:
             logger.debug(f"Save logs error: {e}")
 
-    # ── Master Display ────────────────────────────────────
-    def display(self):
-        """Renders the full dashboard in terminal."""
+    # ── Master Display ────────────────────────────────────────────────────────
+    def display(self) -> None:
         self._clear_screen()
         self._header()
         self._account_panel()
@@ -75,16 +73,29 @@ class Dashboard:
         self._performance_panel()
         self._footer()
 
-    # ── Header ────────────────────────────────────────────
-    def _header(self):
+    # ── Header ────────────────────────────────────────────────────────────────
+    def _header(self) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print("=" * 65)
         print(f"  🤖 GODBOT v3.0  |  {now}")
         print("=" * 65)
 
-    # ── Account Panel ─────────────────────────────────────
-    def _account_panel(self):
+    # ── Account Panel ─────────────────────────────────────────────────────────
+    def _account_panel(self) -> None:
+        """
+        FIX: added single retry with 0.5 s sleep before giving up.
+        The very first dashboard render fires immediately after MT5
+        connect() returns — occasionally the IPC session needs a
+        fraction of a second more to settle, causing the first
+        account_info() call to return None even after a successful
+        connect().  One retry is enough to bridge that gap without
+        blocking the UI for a noticeable amount of time.
+        """
         info = mt5.account_info()
+        if info is None:
+            time.sleep(0.5)
+            info = mt5.account_info()
+
         if info is None:
             print("❌ Account info unavailable\n")
             return
@@ -95,33 +106,27 @@ class Dashboard:
         print("\n📊 ACCOUNT OVERVIEW")
         print("-" * 40)
         print(f"  Account  : {info.login}")
+        print(f"  Balance  : {info.balance:>12.2f} {info.currency}")
         print(
-            f"  Balance  : {info.balance:>12.2f} "
-            f"{info.currency}"
-        )
-        print(
-            f"  Equity   : {info.equity:>12.2f} "
-            f"{info.currency}  "
+            f"  Equity   : {info.equity:>12.2f} {info.currency}  "
             f"{equity_icon} ({equity_diff:+.2f})"
         )
-        print(
-            f"  Margin   : {info.margin:>12.2f} "
-            f"{info.currency}"
-        )
-        print(
-            f"  Free Mrgn: {info.margin_free:>12.2f} "
-            f"{info.currency}"
-        )
+        print(f"  Margin   : {info.margin:>12.2f} {info.currency}")
+        print(f"  Free Mrgn: {info.margin_free:>12.2f} {info.currency}")
         print(f"  Leverage : 1:{info.leverage}")
 
-    # ── Positions Panel ───────────────────────────────────
-    def _positions_panel(self):
-        positions = mt5.positions_get()
-        count     = len(positions) if positions else 0
-        print(f"\n📈 OPEN POSITIONS ({count})")
+    # ── Positions Panel ───────────────────────────────────────────────────────
+    def _positions_panel(self) -> None:
+        all_positions = mt5.positions_get() or []
+        bot_positions = [
+            p for p in all_positions
+            if p.magic == self.cfg.MAGIC_NUMBER
+        ]
+
+        print(f"\n📈 OPEN POSITIONS ({len(bot_positions)})")
         print("-" * 65)
 
-        if not positions:
+        if not bot_positions:
             print("  No open positions")
             return
 
@@ -131,19 +136,15 @@ class Dashboard:
         )
         print("  " + "-" * 58)
 
-        total_pnl = 0
-        for pos in positions:
-            if pos.magic != self.cfg.MAGIC_NUMBER:
-                continue
-
-            tick      = mt5.symbol_info_tick(pos.symbol)
+        total_pnl = 0.0
+        for pos in bot_positions:
+            tick = mt5.symbol_info_tick(pos.symbol)
             if tick is None:
                 continue
             current   = tick.bid if pos.type == 0 else tick.ask
             direction = "BUY" if pos.type == 0 else "SELL"
             pnl_icon  = "🟢" if pos.profit >= 0 else "🔴"
             total_pnl += pos.profit
-
             print(
                 f"  {pos.symbol:<10} {direction:<6} "
                 f"{pos.volume:>6.2f} "
@@ -154,21 +155,14 @@ class Dashboard:
 
         print("  " + "-" * 58)
         total_icon = "🟢" if total_pnl >= 0 else "🔴"
-        print(
-            f"  {'TOTAL P&L':<34}"
-            f"{total_icon}{total_pnl:>9.2f}"
-        )
+        print(f"  {'TOTAL P&L':<34}{total_icon}{total_pnl:>9.2f}")
 
-    # ── Signals Panel ─────────────────────────────────────
-    def _signals_panel(self):
-        today = datetime.now().strftime("%Y-%m-%d")
-        today_sigs = [
-            s for s in self.signals_log
-            if s.get("date") == today
-        ]
-        print(
-            f"\n🎯 TODAY'S SIGNALS ({len(today_sigs)} total)"
-        )
+    # ── Signals Panel ─────────────────────────────────────────────────────────
+    def _signals_panel(self) -> None:
+        today      = datetime.now().strftime("%Y-%m-%d")
+        today_sigs = [s for s in self.signals_log if s.get("date") == today]
+
+        print(f"\n🎯 TODAY'S SIGNALS ({len(today_sigs)} total)")
         print("-" * 65)
 
         if not today_sigs:
@@ -179,8 +173,7 @@ class Dashboard:
         for sig in recent:
             icon = "🟢" if sig["direction"] == "BUY" else "🔴"
             print(
-                f"  {icon} {sig['symbol']:<8} "
-                f"{sig['direction']:<5} | "
+                f"  {icon} {sig['symbol']:<8} {sig['direction']:<5} | "
                 f"Entry:{sig['entry']:<10} "
                 f"SL:{sig['sl']:<10} "
                 f"TP:{sig['tp']:<10} | "
@@ -188,16 +181,13 @@ class Dashboard:
                 f"{sig['time']}"
             )
 
-    # ── Performance Panel ─────────────────────────────────
-    def _performance_panel(self):
+    # ── Performance Panel ─────────────────────────────────────────────────────
+    def _performance_panel(self) -> None:
         print("\n📉 TODAY'S PERFORMANCE")
         print("-" * 40)
 
         today        = datetime.now().strftime("%Y-%m-%d")
-        today_trades = [
-            t for t in self.trades_log
-            if t.get("date") == today
-        ]
+        today_trades = [t for t in self.trades_log if t.get("date") == today]
 
         if not today_trades:
             print("  No completed trades today")
@@ -218,16 +208,48 @@ class Dashboard:
         print(f"  Best     : {best:+.2f}")
         print(f"  Worst    : {worst:+.2f}")
 
-    # ── Footer ────────────────────────────────────────────
-    def _footer(self):
+    # ── Footer ────────────────────────────────────────────────────────────────
+    def _footer(self) -> None:
+        scan_status = self._get_scan_status_text()
+        last_scan   = self._get_last_scan_text()
         print("\n" + "=" * 65)
         print(
             f"  ⏱️  Next scan in {self._scan_secs}s  |  "
-            f"M=Menu  P=Pause  Q=Quit"
+            f"{scan_status}  |  {last_scan}"
         )
+        print("  M=Menu  P=Pause  Q=Quit")
         print("=" * 65)
 
-    # ── Logging Methods ───────────────────────────────────
+    def _get_scan_status_text(self) -> str:
+        status_map = {
+            "Running":   "🔄 Scan Active",
+            "Completed": "✅ Scan Complete",
+            "Waiting":   "⏳ Waiting",
+            "Paused":    "⏸  Paused",
+            "Error":     "❌ Scan Error",
+        }
+        return status_map.get(self._scan_status, f"📡 {self._scan_status}")
+
+    def _get_last_scan_text(self) -> str:
+        if not self._last_scan_time:
+            return "Last: Never"
+        diff    = datetime.now() - self._last_scan_time
+        seconds = int(diff.total_seconds())
+        if seconds < 60:
+            return f"Last: {seconds}s ago"
+        return f"Last: {seconds // 60}m ago"
+
+    def update_scan_status(self, status: str) -> None:
+        self._scan_status = status
+        if status == "Completed":
+            self._last_scan_time = datetime.now()
+
+    def force_refresh(self) -> None:
+        self._clear_screen()
+        self._display_initialized = False
+        self.display()
+
+    # ── Logging ───────────────────────────────────────────────────────────────
     def log_signal(
         self,
         symbol:     str,
@@ -235,8 +257,8 @@ class Dashboard:
         entry:      float,
         sl:         float,
         tp:         float,
-        confidence: float
-    ):
+        confidence: float,
+    ) -> None:
         self.signals_log.append({
             "symbol":     symbol,
             "direction":  direction,
@@ -258,8 +280,8 @@ class Dashboard:
         symbol:    str,
         direction: str,
         pnl:       float,
-        ticket:    int
-    ):
+        ticket:    int,
+    ) -> None:
         self.trades_log.append({
             "symbol":    symbol,
             "direction": direction,
@@ -275,24 +297,14 @@ class Dashboard:
             f"{icon} €{pnl:+.2f} | #{ticket}"
         )
 
-    # ── Stats Helper (used by main._daily_summary) ────────
+    # ── Stats ─────────────────────────────────────────────────────────────────
     def get_today_stats(self) -> dict:
-        """
-        Returns today's performance as a dict.
-        Simplifies main.py _daily_summary.
-        """
         today        = datetime.now().strftime("%Y-%m-%d")
-        today_trades = [
-            t for t in self.trades_log
-            if t.get("date") == today
-        ]
-        today_sigs = [
-            s for s in self.signals_log
-            if s.get("date") == today
-        ]
+        today_trades = [t for t in self.trades_log if t.get("date") == today]
+        today_sigs   = [s for s in self.signals_log if s.get("date") == today]
 
-        wins    = [t for t in today_trades if t["pnl"] > 0]
-        losses  = [t for t in today_trades if t["pnl"] <= 0]
+        wins     = [t for t in today_trades if t["pnl"] > 0]
+        losses   = [t for t in today_trades if t["pnl"] <= 0]
         g_profit = sum(t["pnl"] for t in wins)   if wins   else 0.0
         g_loss   = sum(t["pnl"] for t in losses) if losses else 0.0
 
@@ -308,26 +320,15 @@ class Dashboard:
                 len(wins) / len(today_trades) * 100
                 if today_trades else 0.0
             ),
-            "best_trade":  max(
-                (t["pnl"] for t in today_trades), default=0.0
-            ),
-            "worst_trade": min(
-                (t["pnl"] for t in today_trades), default=0.0
-            ),
+            "best_trade":  max((t["pnl"] for t in today_trades), default=0.0),
+            "worst_trade": min((t["pnl"] for t in today_trades), default=0.0),
         }
 
-    # ── Export ────────────────────────────────────────────
-    def export_report(
-        self,
-        filepath: str = "reports/daily_report.csv"
-    ):
-        """Exports today's trade log to CSV."""
+    # ── Export ────────────────────────────────────────────────────────────────
+    def export_report(self, filepath: str = "reports/daily_report.csv") -> None:
         os.makedirs("reports", exist_ok=True)
         today        = datetime.now().strftime("%Y-%m-%d")
-        today_trades = [
-            t for t in self.trades_log
-            if t.get("date") == today
-        ]
+        today_trades = [t for t in self.trades_log if t.get("date") == today]
 
         if not today_trades:
             logger.warning("No trades to export today")
@@ -337,5 +338,6 @@ class Dashboard:
         df.to_csv(filepath, index=False)
         logger.info(f"📄 Report exported → {filepath}")
 
-    def _clear_screen(self):
+    # ── Utilities ─────────────────────────────────────────────────────────────
+    def _clear_screen(self) -> None:
         os.system("cls" if os.name == "nt" else "clear")
