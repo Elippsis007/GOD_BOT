@@ -6,10 +6,18 @@ import os
 import time
 from datetime import datetime
 from typing import List
+import pytz
 from config.settings import CONFIG
 from monitoring.logger import get_logger
 
 logger = get_logger("Dashboard")
+
+# ── Timezone ──────────────────────────────────────────────────────────────────
+MADRID_TZ = pytz.timezone("Europe/Madrid")
+
+def _now_madrid() -> datetime:
+    """Returns current datetime in Madrid local time."""
+    return datetime.now(pytz.utc).astimezone(MADRID_TZ)
 
 
 class Dashboard:
@@ -18,6 +26,7 @@ class Dashboard:
     Displays account stats, open positions,
     recent signals and daily performance.
     Persists logs to disk — survives restarts.
+    All timestamps displayed in Europe/Madrid local time.
     """
 
     def __init__(self, config=CONFIG):
@@ -37,7 +46,7 @@ class Dashboard:
 
     # ── Persistence ───────────────────────────────────────────────────────────
     def _load_today(self) -> None:
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = _now_madrid().strftime("%Y-%m-%d")
         for attr, path in [
             ("signals_log", "reports/signals_log.json"),
             ("trades_log",  "reports/trades_log.json"),
@@ -75,22 +84,13 @@ class Dashboard:
 
     # ── Header ────────────────────────────────────────────────────────────────
     def _header(self) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = _now_madrid().strftime("%Y-%m-%d %H:%M:%S")
         print("=" * 65)
-        print(f"  🤖 GODBOT v3.0  |  {now}")
+        print(f"  🤖 GODBOT v3.0  |  {now} CET")
         print("=" * 65)
 
     # ── Account Panel ─────────────────────────────────────────────────────────
     def _account_panel(self) -> None:
-        """
-        FIX: added single retry with 0.5 s sleep before giving up.
-        The very first dashboard render fires immediately after MT5
-        connect() returns — occasionally the IPC session needs a
-        fraction of a second more to settle, causing the first
-        account_info() call to return None even after a successful
-        connect().  One retry is enough to bridge that gap without
-        blocking the UI for a noticeable amount of time.
-        """
         info = mt5.account_info()
         if info is None:
             time.sleep(0.5)
@@ -159,7 +159,7 @@ class Dashboard:
 
     # ── Signals Panel ─────────────────────────────────────────────────────────
     def _signals_panel(self) -> None:
-        today      = datetime.now().strftime("%Y-%m-%d")
+        today      = _now_madrid().strftime("%Y-%m-%d")
         today_sigs = [s for s in self.signals_log if s.get("date") == today]
 
         print(f"\n🎯 TODAY'S SIGNALS ({len(today_sigs)} total)")
@@ -186,7 +186,7 @@ class Dashboard:
         print("\n📉 TODAY'S PERFORMANCE")
         print("-" * 40)
 
-        today        = datetime.now().strftime("%Y-%m-%d")
+        today        = _now_madrid().strftime("%Y-%m-%d")
         today_trades = [t for t in self.trades_log if t.get("date") == today]
 
         if not today_trades:
@@ -233,7 +233,7 @@ class Dashboard:
     def _get_last_scan_text(self) -> str:
         if not self._last_scan_time:
             return "Last: Never"
-        diff    = datetime.now() - self._last_scan_time
+        diff    = _now_madrid() - self._last_scan_time
         seconds = int(diff.total_seconds())
         if seconds < 60:
             return f"Last: {seconds}s ago"
@@ -242,7 +242,7 @@ class Dashboard:
     def update_scan_status(self, status: str) -> None:
         self._scan_status = status
         if status == "Completed":
-            self._last_scan_time = datetime.now()
+            self._last_scan_time = _now_madrid()
 
     def force_refresh(self) -> None:
         self._clear_screen()
@@ -259,6 +259,7 @@ class Dashboard:
         tp:         float,
         confidence: float,
     ) -> None:
+        now = _now_madrid()
         self.signals_log.append({
             "symbol":     symbol,
             "direction":  direction,
@@ -266,8 +267,8 @@ class Dashboard:
             "sl":         round(sl, 5),
             "tp":         round(tp, 5),
             "confidence": round(confidence, 4),
-            "date":       datetime.now().strftime("%Y-%m-%d"),
-            "time":       datetime.now().strftime("%H:%M:%S"),
+            "date":       now.strftime("%Y-%m-%d"),
+            "time":       now.strftime("%H:%M:%S"),
         })
         self._save_logs()
         logger.info(
@@ -282,13 +283,14 @@ class Dashboard:
         pnl:       float,
         ticket:    int,
     ) -> None:
+        now = _now_madrid()
         self.trades_log.append({
             "symbol":    symbol,
             "direction": direction,
             "pnl":       round(pnl, 2),
             "ticket":    ticket,
-            "date":      datetime.now().strftime("%Y-%m-%d"),
-            "time":      datetime.now().strftime("%H:%M:%S"),
+            "date":      now.strftime("%Y-%m-%d"),
+            "time":      now.strftime("%H:%M:%S"),
         })
         self._save_logs()
         icon = "✅" if pnl >= 0 else "❌"
@@ -299,7 +301,7 @@ class Dashboard:
 
     # ── Stats ─────────────────────────────────────────────────────────────────
     def get_today_stats(self) -> dict:
-        today        = datetime.now().strftime("%Y-%m-%d")
+        today        = _now_madrid().strftime("%Y-%m-%d")
         today_trades = [t for t in self.trades_log if t.get("date") == today]
         today_sigs   = [s for s in self.signals_log if s.get("date") == today]
 
@@ -327,7 +329,7 @@ class Dashboard:
     # ── Export ────────────────────────────────────────────────────────────────
     def export_report(self, filepath: str = "reports/daily_report.csv") -> None:
         os.makedirs("reports", exist_ok=True)
-        today        = datetime.now().strftime("%Y-%m-%d")
+        today        = _now_madrid().strftime("%Y-%m-%d")
         today_trades = [t for t in self.trades_log if t.get("date") == today]
 
         if not today_trades:

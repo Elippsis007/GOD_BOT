@@ -59,14 +59,17 @@ class SentimentAnalyzer:
     Hybrid sentiment engine: Gemini (EURUSD only) → FinBERT → VADER.
     Each symbol fetches articles using its OWN keywords only,
     preventing identical scores across all pairs.
+
+    Uses new google.genai package (replaces deprecated google.generativeai).
     """
 
     def __init__(self):
-        self._gemini       = None
-        self._finbert_pipe = None
-        self._vader        = None
-        self._cache:       dict = {}
-        self._cache_time:  dict = {}
+        self._gemini_client = None   # google.genai client instance
+        self._gemini_model  = None   # model name string
+        self._finbert_pipe  = None
+        self._vader         = None
+        self._cache:        dict = {}
+        self._cache_time:   dict = {}
         self._load_gemini()
         self._load_finbert()
 
@@ -81,13 +84,27 @@ class SentimentAnalyzer:
             if not GEMINI_API_KEY or GEMINI_API_KEY == "PASTE_YOUR_GEMINI_KEY_HERE":
                 logger.info("Gemini key not set — using FinBERT")
                 return
-            import google.generativeai as genai
-            genai.configure(api_key=GEMINI_API_KEY)
-            self._gemini = genai.GenerativeModel("gemini-2.0-flash")
-            logger.info(
-                "✅ Gemini loaded — contextual sentiment active "
-                "(~92% accuracy) [EURUSD only]"
-            )
+
+            # ── NEW: google.genai replaces deprecated google.generativeai ────
+            try:
+                from google import genai
+                self._gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+                self._gemini_model  = "gemini-2.0-flash"
+                logger.info(
+                    "✅ Gemini loaded — contextual sentiment active "
+                    "(~92% accuracy) [EURUSD only]"
+                )
+            except ImportError:
+                # Fallback: try old package if new one not yet installed
+                import google.generativeai as genai_old
+                genai_old.configure(api_key=GEMINI_API_KEY)
+                self._gemini_client = genai_old.GenerativeModel("gemini-2.0-flash")
+                self._gemini_model  = "legacy"
+                logger.info(
+                    "✅ Gemini loaded (legacy package) — contextual sentiment active "
+                    "(~92% accuracy) [EURUSD only]"
+                )
+
         except Exception as e:
             logger.warning(f"Gemini load failed: {e} — using FinBERT")
 
@@ -119,19 +136,14 @@ class SentimentAnalyzer:
         """
         Fetch up to 20 articles for a symbol using ONLY that symbol's
         keywords, sampling evenly across all feeds before hitting the cap.
-
-        FIX: old inner-loop break fired as soon as any single feed produced
-        20 articles, leaving all remaining feeds unsampled. New approach
-        collects up to 5 articles per feed first, then fills to 20 from
-        whatever feeds had more, ensuring broad source coverage.
         """
         kw = CURRENCY_KEYWORDS.get(symbol, [])
         if not kw:
             logger.warning(f"No keywords defined for {symbol}")
             return []
 
-        per_feed:   list = []     # list of lists, one per feed
-        total_found: int = 0
+        per_feed:    list = []
+        total_found: int  = 0
 
         for src, url in RSS_FEEDS.items():
             feed_articles: list = []
@@ -141,7 +153,6 @@ class SentimentAnalyzer:
                     title   = entry.get("title", "")
                     summary = entry.get("summary", "")
                     txt     = f"{title} {summary}".lower()
-
                     if any(k.lower() in txt for k in kw):
                         feed_articles.append({
                             "title":   title,
@@ -149,13 +160,12 @@ class SentimentAnalyzer:
                             "source":  src,
                         })
             except Exception:
-                pass    # silently skip dead feeds
+                pass
 
             per_feed.append(feed_articles)
             total_found += len(feed_articles)
 
         # Round-robin merge across feeds up to 20 articles total
-        # so no single feed monopolises the sample
         articles: list = []
         idx = 0
         while len(articles) < 20 and any(per_feed):
@@ -177,10 +187,9 @@ class SentimentAnalyzer:
     # ── Scoring Engines ───────────────────────────────────────────────────────
 
     def _score_gemini(self, articles: list, symbol: str) -> dict | None:
-        if not self._gemini or not articles:
+        if not self._gemini_client or not articles:
             return None
 
-        # Require a minimum number of articles before trusting Gemini's score
         if len(articles) < MIN_ARTICLES:
             logger.debug(
                 f"Gemini skipped for {symbol} — only {len(articles)} articles "
@@ -197,21 +206,31 @@ class SentimentAnalyzer:
             '{"score": <float -1.0..1.0>, "label": "Bullish|Bearish|Neutral", '
             '"confidence": <0.0..1.0>, "reasoning": "one-sentence"}'
         )
+
         try:
-            resp  = self._gemini.generate_content(prompt)
-            match = re.search(r"\{.*?\}", resp.text, re.DOTALL)
+            # ── NEW google.genai API call ─────────────────────────────────────
+            if self._gemini_model != "legacy":
+                from google import genai
+                response = self._gemini_client.models.generate_content(
+                    model=self._gemini_model,
+                    contents=prompt,
+                )
+                text = response.text
+            else:
+                # Legacy fallback path for old google.generativeai package
+                resp = self._gemini_client.generate_content(prompt)
+                text = resp.text
+
+            match = re.search(r"\{.*?\}", text, re.DOTALL)
             if not match:
                 logger.warning("Gemini response contained no JSON object")
                 return None
 
-            data = json.loads(match.group())
-
+            data       = json.loads(match.group())
             score      = float(data.get("score",      0.0))
             confidence = float(data.get("confidence", 0.0))
             label      = data.get("label", "Neutral")
 
-            # FIX: reject low-confidence Gemini results rather than returning
-            # a bogus 0.7 default confidence that blocks legitimate trades
             if confidence < 0.5:
                 logger.debug(
                     f"Gemini result for {symbol} rejected — "
@@ -235,7 +254,7 @@ class SentimentAnalyzer:
                     "⚠️ Gemini quota hit — disabling for this session, "
                     "switching to FinBERT"
                 )
-                self._gemini = None
+                self._gemini_client = None
             else:
                 logger.warning(f"Gemini scoring failed: {e}")
         return None
@@ -246,10 +265,8 @@ class SentimentAnalyzer:
         try:
             scores: list = []
             for art in articles[:15]:
-                # FIX: ensure we always pass a single string, not a list,
-                # to the pipeline so [0] indexing is always valid
                 title  = str(art["title"])[:512]
-                result = self._finbert_pipe(title)[0]   # list of label dicts
+                result = self._finbert_pipe(title)[0]
                 best   = max(result, key=lambda x: x["score"])
                 val    = (
                     {"positive": 1, "negative": -1, "neutral": 0}
@@ -278,7 +295,6 @@ class SentimentAnalyzer:
         self._load_vader()
         if not self._vader or not articles:
             return dict(_NEUTRAL_RESULT)
-
         try:
             comps = [
                 self._vader.polarity_scores(str(a["title"]))["compound"]
@@ -303,9 +319,6 @@ class SentimentAnalyzer:
         """Return sentiment dict for a symbol. Cached for 30 minutes."""
         now = datetime.now()
 
-        # FIX: was using .seconds which returns only the seconds *component*
-        # of the timedelta. A 2-hour-old cache entry shows .seconds == 0 and
-        # appears valid indefinitely. total_seconds() returns full elapsed time.
         if (
             symbol in self._cache
             and symbol in self._cache_time
@@ -316,8 +329,7 @@ class SentimentAnalyzer:
 
         articles = self._fetch_articles(symbol)
 
-        # Gemini only for EURUSD — preserves free-tier API quota
-        if symbol == "EURUSD" and self._gemini:
+        if symbol == "EURUSD" and self._gemini_client:
             result = (
                 self._score_gemini(articles, symbol)
                 or self._score_finbert(articles)
@@ -329,9 +341,6 @@ class SentimentAnalyzer:
                 or self._score_vader(articles)
             )
 
-        # FIX: final safety net — if the entire chain somehow returns None
-        # (all engines unavailable), use the neutral fallback so result.get()
-        # on the next line never raises AttributeError.
         if result is None:
             logger.warning(
                 f"All sentiment engines failed for {symbol} — "
@@ -356,7 +365,7 @@ class SentimentAnalyzer:
         from config.settings import CONFIG
         engine_label = (
             "🤖 Gemini (~92%) for EURUSD | 🧠 FinBERT (~88%) for others"
-            if self._gemini
+            if self._gemini_client
             else (
                 "🧠 FinBERT (~88% accuracy)"
                 if self._finbert_pipe
