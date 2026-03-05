@@ -67,7 +67,7 @@ class TradingConfig:
 
     # ── ML Model ──────────────────────────────────────────────────────────────
     ML_LOOKBACK:       int   = 60
-    ML_MIN_CONFIDENCE: float = 0.50
+    ML_MIN_CONFIDENCE: float = 0.45        # ← CHANGED from 0.50
     ML_FEATURES: List[str] = field(default_factory=lambda: [
         "ema_fast", "ema_slow", "rsi", "bb_upper", "bb_lower",
         "atr", "macd", "macd_signal", "volume",
@@ -84,7 +84,7 @@ class TradingConfig:
     ])
 
     # ── Signal Score ──────────────────────────────────────────────────────────
-    MIN_SIGNAL_SCORE: int = 4
+    MIN_SIGNAL_SCORE: int = 3              # ← CHANGED from 4
 
     # ── Telegram Alert Flags ──────────────────────────────────────────────────
     TELEGRAM_SEND_SIGNALS: bool = True
@@ -109,7 +109,7 @@ class TradingConfig:
     ALERT_COOLDOWN_NEWS:   int = 3600
 
     # ── Alert Confidence Threshold ────────────────────────────────────────────
-    ALERT_MIN_CONFIDENCE: float = 0.70
+    ALERT_MIN_CONFIDENCE: float = 0.50     # ← CHANGED from 0.70
 
     # ── Scalper Style ─────────────────────────────────────────────────────────
     SCALPER_TF_PRIMARY:   int   = 1

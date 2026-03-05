@@ -62,6 +62,10 @@ class SignalEngine:
         if df is None or len(df) < 2:
             return None
 
+        # ── Normalise column names to lowercase ───────────
+        df   = df.copy()
+        df.columns = df.columns.str.lower()
+
         last    = df.iloc[-1]
         prev    = df.iloc[-2]
         score   = 0
@@ -91,54 +95,26 @@ class SignalEngine:
             score -= 1
             reasons.append("❌ MACD bearish crossover")
 
-        # ── Filter 3: RSI Zone ────────────────────────────
-        # FIX: the original had two overlapping conditions that left a gap
-        # and could hit the wrong branch:
-        #
-        #   Bullish : 40 < RSI < 70  (RSI_OVERBOUGHT)
-        #   Bearish : 30 < RSI < 60  (RSI_OVERSOLD < RSI < 60)
-        #
-        # Problem 1 — GAP: RSI between 60 and 70 matched neither branch,
-        # contributing nothing to the score even in a strong uptrend.
-        #
-        # Problem 2 — OVERLAP: RSI between 40 and 60 satisfied BOTH
-        # conditions simultaneously. Because Python evaluates the first
-        # `if` branch and skips `elif`, an RSI of 45 always scored bullish
-        # and could never score bearish — masking genuine downtrends.
-        #
-        # FIX: split into three fully exclusive, fully covering zones:
-        #   Bullish : RSI_OVERSOLD(30) < RSI <= 60   → healthy momentum up
-        #   Neutral : 60 < RSI < RSI_OVERBOUGHT(70)  → no score (transition)
-        #   Bearish : RSI_OVERBOUGHT(70) <= RSI       → overbought, fade
-        #   AND mirror for the sell side:
-        #   Bearish : RSI_OVERSOLD(30) <= RSI < 60   → healthy momentum down
-        #   Bullish : RSI < RSI_OVERSOLD(30)          → oversold, bounce
-        #
-        # Simplified to the clearest mutually exclusive split:
+        # ── Filter 3: RSI Zone ─────────────────────────────
         rsi = last["rsi"]
         if self.cfg.RSI_OVERSOLD < rsi < 60:
-            # Rising from oversold into mid-range — bullish momentum
             score += 1
             reasons.append(f"✅ RSI bullish zone ({rsi:.1f})")
         elif 60 < rsi < self.cfg.RSI_OVERBOUGHT:
-            # Between 60 and overbought — bearish lean, trend fading
             score -= 1
             reasons.append(f"❌ RSI bearish zone ({rsi:.1f})")
         elif rsi >= self.cfg.RSI_OVERBOUGHT:
-            # Overbought — strong bearish signal
             score -= 1
             reasons.append(f"❌ RSI overbought ({rsi:.1f})")
         elif rsi <= self.cfg.RSI_OVERSOLD:
-            # Oversold — strong bullish signal
             score += 1
             reasons.append(f"✅ RSI oversold ({rsi:.1f})")
-        # RSI exactly at 60 scores neutral — intentional dead zone
 
         # ── Filter 4: Bollinger Band Position ─────────────
-        if last["Close"] > last["bb_mid"] and last["Close"] < last["bb_upper"]:
+        if last["close"] > last["bb_mid"] and last["close"] < last["bb_upper"]:
             score += 1
             reasons.append("✅ Price above BB midline")
-        elif last["Close"] < last["bb_mid"] and last["Close"] > last["bb_lower"]:
+        elif last["close"] < last["bb_mid"] and last["close"] > last["bb_lower"]:
             score -= 1
             reasons.append("❌ Price below BB midline")
 
@@ -175,7 +151,7 @@ class SignalEngine:
         # ── Determine Signal ───────────────────────────────
         strength = abs(score) / 8.0
         atr      = last["atr"]
-        entry    = last["Close"]
+        entry    = last["close"]                        # ← FIXED from "Close"
 
         if score >= self.BULL_THRESHOLD:
             sl          = entry - (atr * 1.5)

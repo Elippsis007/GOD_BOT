@@ -54,6 +54,42 @@ class CalendarScanner:
         "surprise hike", "recession",
     ]
 
+    # ── Preview/Reminder Filter — these are NOT live events ──────────────────
+    # Headlines containing these phrases are articles written ABOUT
+    # upcoming events, not the actual releases. They should never
+    # trigger a news block.
+    PREVIEW_KEYWORDS = [
+        "tomorrow",
+        "next week",
+        "reminder",
+        "preview",
+        "ahead of",
+        "scheduled for",
+        "looking ahead",
+        "what to expect",
+        "week ahead",
+        "what to watch",
+        "market preview",
+        "economic preview",
+        "forecast",
+        "expectations for",
+        "what we know",
+        "coming up",
+        "prepare for",
+        "traders await",
+        "markets await",
+        "eyes on",
+        "watch out for",
+        "on the horizon",
+        "due tomorrow",
+        "due next",
+        "due friday",
+        "due monday",
+        "due tuesday",
+        "due wednesday",
+        "due thursday",
+    ]
+
     # ── Symbol → Currencies ───────────────────────────────────────────────────
     SYMBOL_CURRENCIES = {
         "EURUSD": ["EUR", "USD"],
@@ -87,6 +123,17 @@ class CalendarScanner:
         self._cache_time: Optional[datetime]     = None
         self.CACHE_MINUTES = 60
 
+    # ── Preview Detection ─────────────────────────────────────────────────────
+    @classmethod
+    def _is_preview_article(cls, text: str) -> bool:
+        """
+        Returns True if the headline/summary is a preview or reminder
+        article about a future event rather than an actual live release.
+        These should NOT trigger a news block.
+        """
+        text_lower = text.lower()
+        return any(kw in text_lower for kw in cls.PREVIEW_KEYWORDS)
+
     # ── Main Safety Check ─────────────────────────────────────────────────────
     def is_safe_to_trade(
         self,
@@ -98,7 +145,6 @@ class CalendarScanner:
         Primary method called before every trade.
         Returns whether it is currently safe to trade the given symbol.
         """
-        # RSS is the only working source — MT5 calendar API does not exist
         events = self._get_rss_events(symbol)
 
         if events is None or events.empty:
@@ -123,7 +169,6 @@ class CalendarScanner:
             mins_to    = (event_time - now).total_seconds() / 60
             mins_since = (now - event_time).total_seconds() / 60
 
-            # >= 0 ensures the exact release minute is always blocked
             too_close_before = 0 <= mins_to    <= minutes_before
             too_close_after  = 0 <= mins_since <= minutes_after
 
@@ -154,28 +199,13 @@ class CalendarScanner:
         self,
         symbol: Optional[str] = None,
     ) -> Optional[pd.DataFrame]:
-        """
-        FIX: mt5.calendar_value_history() does not exist in the
-        MetaTrader5 Python package. Calling it raises AttributeError
-        on every scan cycle, spamming the log with:
-            'module MetaTrader5 has no attribute calendar_value_history'
-
-        The MT5 economic calendar is only accessible via the desktop
-        terminal UI — it is not exposed through the Python API.
-        This method now returns None immediately so the bot falls
-        through to the RSS feed without any error being logged.
-        """
         return None
 
-    # ── RSS Calendar — PRIMARY (only working source) ──────────────────────────
+    # ── RSS Calendar — PRIMARY ────────────────────────────────────────────────
     def _get_rss_events(
         self,
         symbol: Optional[str] = None,
     ) -> Optional[pd.DataFrame]:
-        """
-        Reads legitimate RSS feeds.
-        Checks cache first — only fetches if stale.
-        """
         try:
             if self._is_cache_valid():
                 df = self._cache_data.copy()
@@ -185,9 +215,7 @@ class CalendarScanner:
             if df is None or df.empty:
                 return None
 
-            # Filter by positively identified currencies only —
-            # excludes "UNKNOWN" so unidentified headlines don't
-            # wrongly block all USD pairs.
+            # Filter by positively identified currencies only
             if symbol and symbol in self.SYMBOL_CURRENCIES:
                 currencies = self.SYMBOL_CURRENCIES[symbol]
                 mask = df["currency"].apply(
@@ -216,6 +244,15 @@ class CalendarScanner:
                     title   = entry.get("title", "")
                     summary = entry.get("summary", "")
                     text    = f"{title} {summary}".lower()
+
+                    # ── Skip preview / reminder articles ──────────────────
+                    # These headlines mention future events but are not
+                    # actual releases — they must not trigger a news block.
+                    if self._is_preview_article(text):
+                        logger.debug(
+                            f"📰 Skipping preview article: {title[:60]}"
+                        )
+                        continue
 
                     is_high = any(kw in text for kw in self.HIGH_IMPACT_KEYWORDS)
                     if not is_high:
@@ -255,7 +292,7 @@ class CalendarScanner:
     def _detect_currency(self, text: str) -> str:
         """
         Detects which currency an article is about.
-        Returns "UNKNOWN" for unmatched headlines so they
+        Returns UNKNOWN for unmatched headlines so they
         do not incorrectly block USD pairs.
         """
         for currency, keywords in self.KEYWORD_CURRENCIES.items():
@@ -265,12 +302,9 @@ class CalendarScanner:
 
     # ── Today's Events Summary ────────────────────────────────────────────────
     def get_todays_events(self) -> pd.DataFrame:
-        """Returns all high impact events for today."""
         df = self._get_rss_events()
-
         if df is None or df.empty:
             return pd.DataFrame()
-
         today = datetime.now(pytz.utc).date()
         mask  = df["datetime"].apply(
             lambda x: x.date() == today if hasattr(x, "date") else False
@@ -278,7 +312,6 @@ class CalendarScanner:
         return df[mask].reset_index(drop=True)
 
     def print_todays_events(self) -> None:
-        """Pretty-prints today's high impact events to the console."""
         df = self.get_todays_events()
         print("\n📅 TODAY'S HIGH IMPACT EVENTS")
         print("=" * 55)
@@ -303,7 +336,5 @@ class CalendarScanner:
     def _is_cache_valid(self) -> bool:
         if self._cache_data is None or self._cache_time is None:
             return False
-        # total_seconds() gives full elapsed duration, not just the
-        # seconds component of the timedelta
         age_minutes = (datetime.now() - self._cache_time).total_seconds() / 60
         return age_minutes < self.CACHE_MINUTES
