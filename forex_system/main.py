@@ -368,73 +368,82 @@ class ForexSystem:
             f"✅ Gate 3 PASSED — ML={ml_direction} Conf={ml['confidence']:.0%}"
         )
 
-        # ── Gate 4 — Sentiment ────────────────────────────────────────────────
-        sent = self.sentiment.get_symbol_sentiment(symbol)
-        logger.debug(
-            f"📰 Sentiment: {sent['label']} | "
-            f"Score: {sent['score']:+.3f} | "
-            f"Conf: {sent['confidence']:.0%} | "
-            f"Engine: {sent['engine']}"
-        )
-
-        if signal.signal.value == "BUY" and sent["score"] < -0.1:
+        # ── Gate 4 — Sentiment (Day Trader only) ──────────────────────────────
+        # Scalper trades on M1 candles — sentiment updates every 30 minutes
+        # and is far too slow to be relevant for a 1-minute scalp trade.
+        if self.style == "scalper":
+            logger.debug("⏭️  Gate 4 SKIPPED — Sentiment not used in Scalper mode")
+        else:
+            sent = self.sentiment.get_symbol_sentiment(symbol)
             logger.debug(
-                f"⛔ Gate 4 BLOCKED — Sentiment bearish "
-                f"({sent['score']:+.3f}) conflicts with BUY signal"
+                f"📰 Sentiment: {sent['label']} | "
+                f"Score: {sent['score']:+.3f} | "
+                f"Conf: {sent['confidence']:.0%} | "
+                f"Engine: {sent['engine']}"
             )
-            return
-        if signal.signal.value == "SELL" and sent["score"] > 0.1:
+            if signal.signal.value == "BUY" and sent["score"] < -0.1:
+                logger.debug(
+                    f"⛔ Gate 4 BLOCKED — Sentiment bearish "
+                    f"({sent['score']:+.3f}) conflicts with BUY signal"
+                )
+                return
+            if signal.signal.value == "SELL" and sent["score"] > 0.1:
+                logger.debug(
+                    f"⛔ Gate 4 BLOCKED — Sentiment bullish "
+                    f"({sent['score']:+.3f}) conflicts with SELL signal"
+                )
+                return
             logger.debug(
-                f"⛔ Gate 4 BLOCKED — Sentiment bullish "
-                f"({sent['score']:+.3f}) conflicts with SELL signal"
+                f"✅ Gate 4 PASSED — Sentiment {sent['label']} ({sent['score']:+.3f})"
             )
-            return
 
-        logger.debug(
-            f"✅ Gate 4 PASSED — Sentiment {sent['label']} ({sent['score']:+.3f})"
-        )
-
-        # ── Gate 5 — Intermarket ──────────────────────────────────────────────
-        inter = self.intermarket.get_intermarket_signal(symbol)
-        logger.debug(
-            f"🌐 Intermarket score: {inter['score']:+.3f}"
-        )
-
-        if signal.signal.value == "BUY" and inter["score"] < -0.1:
+        # ── Gate 5 — Intermarket (Day Trader only) ────────────────────────────
+        # Intermarket correlations operate on H1/H4 timescales — irrelevant
+        # for M1 scalping where trades last 2-10 minutes.
+        if self.style == "scalper":
+            logger.debug("⏭️  Gate 5 SKIPPED — Intermarket not used in Scalper mode")
+        else:
+            inter = self.intermarket.get_intermarket_signal(symbol)
             logger.debug(
-                f"⛔ Gate 5 BLOCKED — Intermarket bearish "
-                f"({inter['score']:+.3f}) conflicts with BUY signal"
+                f"🌐 Intermarket score: {inter['score']:+.3f}"
             )
-            return
-        if signal.signal.value == "SELL" and inter["score"] > 0.1:
+            if signal.signal.value == "BUY" and inter["score"] < -0.1:
+                logger.debug(
+                    f"⛔ Gate 5 BLOCKED — Intermarket bearish "
+                    f"({inter['score']:+.3f}) conflicts with BUY signal"
+                )
+                return
+            if signal.signal.value == "SELL" and inter["score"] > 0.1:
+                logger.debug(
+                    f"⛔ Gate 5 BLOCKED — Intermarket bullish "
+                    f"({inter['score']:+.3f}) conflicts with SELL signal"
+                )
+                return
             logger.debug(
-                f"⛔ Gate 5 BLOCKED — Intermarket bullish "
-                f"({inter['score']:+.3f}) conflicts with SELL signal"
+                f"✅ Gate 5 PASSED — Intermarket score={inter['score']:+.3f}"
             )
-            return
 
-        logger.debug(
-            f"✅ Gate 5 PASSED — Intermarket score={inter['score']:+.3f}"
-        )
-
-        # ── Gate 6 — COT ──────────────────────────────────────────────────────
-        cot = self.cot.get_cot_signal(symbol)
-        logger.debug(
-            f"📊 COT bias: {cot['bias']}"
-        )
-
-        if signal.signal.value == "BUY" and cot["bias"] == "Bearish":
+        # ── Gate 6 — COT (Day Trader only) ────────────────────────────────────
+        # COT data is published weekly — completely irrelevant for scalping.
+        # Only meaningful for multi-day swing/position trading.
+        if self.style == "scalper":
+            logger.debug("⏭️  Gate 6 SKIPPED — COT not used in Scalper mode")
+        else:
+            cot = self.cot.get_cot_signal(symbol)
             logger.debug(
-                f"⛔ Gate 6 BLOCKED — COT bias Bearish conflicts with BUY signal"
+                f"📊 COT bias: {cot['bias']}"
             )
-            return
-        if signal.signal.value == "SELL" and cot["bias"] == "Bullish":
-            logger.debug(
-                f"⛔ Gate 6 BLOCKED — COT bias Bullish conflicts with SELL signal"
-            )
-            return
-
-        logger.debug(f"✅ Gate 6 PASSED — COT bias={cot['bias']}")
+            if signal.signal.value == "BUY" and cot["bias"] == "Bearish":
+                logger.debug(
+                    f"⛔ Gate 6 BLOCKED — COT bias Bearish conflicts with BUY signal"
+                )
+                return
+            if signal.signal.value == "SELL" and cot["bias"] == "Bullish":
+                logger.debug(
+                    f"⛔ Gate 6 BLOCKED — COT bias Bullish conflicts with SELL signal"
+                )
+                return
+            logger.debug(f"✅ Gate 6 PASSED — COT bias={cot['bias']}")
 
         # ── All gates passed — fire alert ─────────────────────────────────────
         logger.info(

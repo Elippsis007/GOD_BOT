@@ -1,5 +1,4 @@
 # research/calendar_scanner.py
-import MetaTrader5 as mt5
 import feedparser
 import pandas as pd
 import pytz
@@ -11,330 +10,245 @@ logger = get_logger("CalendarScanner")
 
 
 class CalendarScanner:
-    """
-    Economic calendar using two reliable FREE sources:
+    """Economic calendar using RSS feeds only (MT5 calendar API unavailable)."""
 
-    PRIMARY:  RSS feeds from FXStreet, Investing.com, ForexLive, DailyFX
-              → Legitimate RSS, never blocked
-              → They want you to use these feeds
-              → Zero scraping
-
-    NOTE:     MT5 built-in calendar API (calendar_value_history) does NOT
-              exist in the MetaTrader5 Python package. The MT5 calendar
-              is only available via the desktop terminal UI, not the Python
-              API. All calendar data is sourced from RSS feeds only.
-    """
-
-    # ── RSS Feeds ─────────────────────────────────────────────────────────────
-    CALENDAR_FEEDS = {
+    RSS_FEEDS = {
         "fxstreet":  "https://www.fxstreet.com/rss/news",
-        "investing": "https://www.investing.com/rss/news_14.rss",
-        "forexlive": "https://www.forexlive.com/feed/news",
-        "dailyfx":   "https://www.dailyfx.com/feeds/all",
+        "investing":  "https://www.investing.com/rss/news_14.rss",
+        "forexlive":  "https://www.forexlive.com/feed/news",
+        "dailyfx":    "https://www.dailyfx.com/feeds/all",
     }
 
-    # ── High Impact Keywords ──────────────────────────────────────────────────
     HIGH_IMPACT_KEYWORDS = [
-        "non-farm payroll", "nfp", "fed rate", "fomc",
-        "federal reserve", "cpi", "inflation", "gdp",
-        "unemployment", "interest rate decision",
-        "powell", "jobs report",
-        "ecb rate", "ecb decision", "lagarde",
-        "eurozone cpi", "eurozone gdp",
-        "boe rate", "bank of england", "bailey",
-        "uk cpi", "uk gdp",
-        "boj rate", "bank of japan", "ueda",
-        "japan cpi", "japan gdp",
-        "rba rate", "reserve bank australia",
-        "australia cpi",
-        "boc rate", "bank of canada",
-        "canada cpi",
-        "rate decision", "rate hike", "rate cut",
-        "emergency meeting", "surprise cut",
-        "surprise hike", "recession",
+        "non-farm payroll", "nonfarm payroll", "nfp",
+        "fed rate", "federal reserve", "fomc", "fed decision",
+        "interest rate decision", "rate decision", "rate hike", "rate cut",
+        "cpi", "inflation", "consumer price",
+        "gdp", "gross domestic product",
+        "unemployment", "jobless claims", "jobs report",
+        "retail sales", "trade balance",
+        "pmi", "ism manufacturing", "ism services",
+        "ecb", "boe", "bank of england", "bank of japan", "boj",
+        "powell", "lagarde", "bailey",
+        "payroll", "employment change",
+        "core inflation", "pce", "personal consumption",
+        "durable goods", "housing starts",
+        "ats", "ats report",
     ]
 
-    # ── Preview/Reminder Filter — these are NOT live events ──────────────────
-    # Headlines containing these phrases are articles written ABOUT
-    # upcoming events, not the actual releases. They should never
-    # trigger a news block.
+    # ── Only block articles that are genuinely future‑event previews ─────────
     PREVIEW_KEYWORDS = [
         "tomorrow",
         "next week",
-        "reminder",
-        "preview",
-        "ahead of",
-        "scheduled for",
-        "looking ahead",
-        "what to expect",
+        "next month",
+        "upcoming week",
         "week ahead",
+        "preview:",          # colon makes it a section header, not a result
         "what to watch",
-        "market preview",
-        "economic preview",
-        "forecast",
-        "expectations for",
-        "what we know",
-        "coming up",
-        "prepare for",
-        "traders await",
-        "markets await",
-        "eyes on",
-        "watch out for",
-        "on the horizon",
-        "due tomorrow",
+        "events to watch",
+        "trading week ahead",
+        "economic week ahead",
+        "scheduled for",
+        "due out",
+        "due on",
         "due next",
-        "due friday",
-        "due monday",
-        "due tuesday",
-        "due wednesday",
-        "due thursday",
+        "will be released",
+        "set to release",
+        "looking ahead",
+        "ahead of next",
+        "markets brace",
+        "traders await",
+        "all eyes on",
     ]
 
-    # ── Symbol → Currencies ───────────────────────────────────────────────────
     SYMBOL_CURRENCIES = {
         "EURUSD": ["EUR", "USD"],
         "GBPUSD": ["GBP", "USD"],
         "USDJPY": ["USD", "JPY"],
         "AUDUSD": ["AUD", "USD"],
         "USDCAD": ["USD", "CAD"],
-        "XAUUSD": ["XAU", "USD", "GOLD"],
+        "XAUUSD": ["XAU", "USD"],
     }
 
-    # ── Keyword → Currency ────────────────────────────────────────────────────
-    KEYWORD_CURRENCIES = {
-        "USD": ["fed", "fomc", "powell", "nfp", "non-farm",
-                "us cpi", "us gdp", "dollar", "treasury",
-                "federal reserve", "us jobs"],
-        "EUR": ["ecb", "lagarde", "eurozone", "euro",
-                "european central bank"],
-        "GBP": ["boe", "bailey", "uk cpi", "uk gdp",
-                "bank of england", "sterling", "pound"],
-        "JPY": ["boj", "ueda", "japan", "yen",
-                "bank of japan"],
-        "AUD": ["rba", "australia", "aussie",
-                "reserve bank australia"],
-        "CAD": ["boc", "canada", "loonie",
-                "bank of canada"],
-        "XAU": ["gold", "bullion", "precious metals"],
+    KEYWORD_CURRENCY = {
+        "fed":       "USD", "fomc":     "USD", "powell":   "USD",
+        "payroll":   "USD", "nfp":      "USD", "jobless":  "USD",
+        "ism":       "USD", "pce":      "USD", "durable":  "USD",
+        "housing":   "USD", "retail":   "USD",
+        "ecb":       "EUR", "lagarde":  "EUR", "euro":     "EUR",
+        "boe":       "GBP", "bailey":   "GBP", "sterling": "GBP",
+        "boj":       "JPY", "japan":    "JPY", "yen":      "JPY",
+        "rba":       "AUD", "australia":"AUD", "aussie":   "AUD",
+        "boc":       "CAD", "canada":   "CAD", "loonie":   "CAD",
+        "gold":      "XAU", "xau":      "XAU",
     }
+
+    CACHE_MINUTES = 60
 
     def __init__(self):
-        self._cache_data: Optional[pd.DataFrame] = None
-        self._cache_time: Optional[datetime]     = None
-        self.CACHE_MINUTES = 60
+        self._cache_df:   Optional[pd.DataFrame] = None
+        self._cache_time: Optional[datetime]      = None
 
-    # ── Preview Detection ─────────────────────────────────────────────────────
-    @classmethod
-    def _is_preview_article(cls, text: str) -> bool:
-        """
-        Returns True if the headline/summary is a preview or reminder
-        article about a future event rather than an actual live release.
-        These should NOT trigger a news block.
-        """
-        text_lower = text.lower()
-        return any(kw in text_lower for kw in cls.PREVIEW_KEYWORDS)
+    # ── public API ────────────────────────────────────────────────────────────
 
-    # ── Main Safety Check ─────────────────────────────────────────────────────
     def is_safe_to_trade(
         self,
-        symbol:         str,
+        symbol: str,
         minutes_before: int = 30,
         minutes_after:  int = 15,
     ) -> dict:
-        """
-        Primary method called before every trade.
-        Returns whether it is currently safe to trade the given symbol.
-        """
-        events = self._get_rss_events(symbol)
-
-        if events is None or events.empty:
-            return {
-                "safe":   True,
-                "reason": "No high impact events found",
-                "events": [],
-            }
-
-        now     = datetime.now(pytz.utc)
-        dangers = []
-
-        for _, event in events.iterrows():
-            event_time = event.get("datetime")
-            if event_time is None or pd.isna(event_time):
-                continue
-
-            # Ensure timezone-aware
-            if hasattr(event_time, "tzinfo") and event_time.tzinfo is None:
-                event_time = pytz.utc.localize(event_time)
-
-            mins_to    = (event_time - now).total_seconds() / 60
-            mins_since = (now - event_time).total_seconds() / 60
-
-            too_close_before = 0 <= mins_to    <= minutes_before
-            too_close_after  = 0 <= mins_since <= minutes_after
-
-            if too_close_before or too_close_after:
-                dangers.append({
-                    "event":    event.get("event", "Unknown"),
-                    "currency": event.get("currency", ""),
-                    "impact":   event.get("impact", "High"),
-                    "time":     str(event_time),
-                    "minutes":  round(mins_to, 1),
-                })
-
-        if dangers:
-            return {
-                "safe":   False,
-                "reason": "High impact news event nearby",
-                "events": dangers,
-            }
-
-        return {
-            "safe":   True,
-            "reason": "Clear of all high impact events",
-            "events": [],
-        }
-
-    # ── MT5 Calendar — DISABLED ───────────────────────────────────────────────
-    def _get_mt5_events(
-        self,
-        symbol: Optional[str] = None,
-    ) -> Optional[pd.DataFrame]:
-        return None
-
-    # ── RSS Calendar — PRIMARY ────────────────────────────────────────────────
-    def _get_rss_events(
-        self,
-        symbol: Optional[str] = None,
-    ) -> Optional[pd.DataFrame]:
+        """Return {'safe': bool, 'reason': str, 'events': list}."""
         try:
-            if self._is_cache_valid():
-                df = self._cache_data.copy()
-            else:
-                df = self._fetch_all_rss_feeds()
+            events_df = self._get_rss_events()
+            if events_df is None or events_df.empty:
+                return {"safe": True, "reason": "No events found", "events": []}
 
-            if df is None or df.empty:
-                return None
+            currencies = self.SYMBOL_CURRENCIES.get(symbol.upper(), [])
+            now_utc    = datetime.now(pytz.utc)
+            blocking   = []
 
-            # Filter by positively identified currencies only
-            if symbol and symbol in self.SYMBOL_CURRENCIES:
-                currencies = self.SYMBOL_CURRENCIES[symbol]
-                mask = df["currency"].apply(
-                    lambda c: c != "UNKNOWN" and any(
-                        cur.upper() in str(c).upper()
-                        for cur in currencies
-                    )
-                )
-                df = df[mask]
+            for _, row in events_df.iterrows():
+                evt_time = row.get("datetime")
+                if evt_time is None:
+                    continue
+                if not evt_time.tzinfo:
+                    evt_time = pytz.utc.localize(evt_time)
 
-            df = df[df["impact"] == "High"]
-            return df.reset_index(drop=True) if not df.empty else None
+                delta_mins = (evt_time - now_utc).total_seconds() / 60
+                in_window  = -minutes_after <= delta_mins <= minutes_before
+
+                if in_window and row.get("currency", "UNKNOWN") in currencies:
+                    blocking.append(row.to_dict())
+
+            if blocking:
+                titles = ", ".join(e.get("event", "?") for e in blocking[:2])
+                return {
+                    "safe":   False,
+                    "reason": f"High-impact event near: {titles}",
+                    "events": blocking,
+                }
+
+            return {"safe": True, "reason": "No blocking events", "events": []}
 
         except Exception as e:
-            logger.error(f"RSS calendar error: {e}")
-            return None
+            logger.warning(f"CalendarScanner error: {e}")
+            return {"safe": True, "reason": f"Error: {e}", "events": []}
 
-    def _fetch_all_rss_feeds(self) -> Optional[pd.DataFrame]:
-        """Fetches and parses all RSS calendar feeds. Updates the cache."""
-        all_events = []
+    def get_todays_events(self) -> list:
+        """Return today's high-impact events as a list of dicts."""
+        try:
+            df = self._get_rss_events()
+            if df is None or df.empty:
+                return []
+            today_utc = datetime.now(pytz.utc).date()
+            result = []
+            for _, row in df.iterrows():
+                evt_time = row.get("datetime")
+                if evt_time is None:
+                    continue
+                if not evt_time.tzinfo:
+                    evt_time = pytz.utc.localize(evt_time)
+                if evt_time.date() == today_utc:
+                    result.append(row.to_dict())
+            return result
+        except Exception:
+            return []
 
-        for source, url in self.CALENDAR_FEEDS.items():
+    def print_todays_events(self) -> None:
+        events = self.get_todays_events()
+        if not events:
+            logger.info("📅 No high-impact events today.")
+            return
+        logger.info(f"📅 Today's high-impact events ({len(events)}):")
+        for e in events:
+            t = e.get("datetime", "?")
+            if hasattr(t, "strftime"):
+                t = t.strftime("%H:%M UTC")
+            logger.info(f"   {t} | {e.get('currency','?'):4s} | {e.get('event','?')}")
+
+    # ── internal ──────────────────────────────────────────────────────────────
+
+    def _get_rss_events(self) -> Optional[pd.DataFrame]:
+        if self._is_cache_valid():
+            return self._cache_df
+        self._cache_df   = self._fetch_all_rss_feeds()
+        self._cache_time = datetime.now(pytz.utc)
+        return self._cache_df
+
+    def _fetch_all_rss_feeds(self) -> pd.DataFrame:
+        rows = []
+        for source, url in self.RSS_FEEDS.items():
             try:
                 feed = feedparser.parse(url)
+                count = 0
                 for entry in feed.entries[:30]:
-                    title   = entry.get("title", "")
-                    summary = entry.get("summary", "")
+                    title   = getattr(entry, "title",   "") or ""
+                    summary = getattr(entry, "summary", "") or ""
                     text    = f"{title} {summary}".lower()
 
-                    # ── Skip preview / reminder articles ──────────────────
-                    # These headlines mention future events but are not
-                    # actual releases — they must not trigger a news block.
+                    # ── skip genuine preview/reminder articles ─────────────
                     if self._is_preview_article(text):
-                        logger.debug(
-                            f"📰 Skipping preview article: {title[:60]}"
-                        )
+                        logger.debug(f"📰 Skipping preview article: {title[:80]}")
                         continue
 
-                    is_high = any(kw in text for kw in self.HIGH_IMPACT_KEYWORDS)
-                    if not is_high:
+                    # ── keep only high-impact items ────────────────────────
+                    if not any(kw in text for kw in self.HIGH_IMPACT_KEYWORDS):
                         continue
 
                     currency = self._detect_currency(text)
+                    pub_dt   = self._parse_pub_date(entry)
 
-                    published = entry.get("published_parsed")
-                    if published:
-                        ev_time = datetime(*published[:6], tzinfo=pytz.utc)
-                    else:
-                        ev_time = datetime.now(pytz.utc)
-
-                    all_events.append({
-                        "datetime": ev_time,
+                    rows.append({
+                        "event":    title[:120],
                         "currency": currency,
-                        "impact":   "High",
-                        "event":    title,
+                        "datetime": pub_dt,
+                        "impact":   "HIGH",
                         "source":   source,
                     })
+                    count += 1
+
+                if count:
+                    logger.debug(f"CalendarScanner: {count} high-impact items from {source}")
 
             except Exception as e:
-                logger.debug(f"RSS {source} error: {e}")
-                continue
+                logger.debug(f"CalendarScanner RSS error ({source}): {e}")
 
-        if not all_events:
-            self._cache_data = pd.DataFrame()
-            self._cache_time = datetime.now()
-            return None
+        if not rows:
+            return pd.DataFrame()
 
-        df = pd.DataFrame(all_events)
-        self._cache_data = df.copy()
-        self._cache_time = datetime.now()
+        df = pd.DataFrame(rows).drop_duplicates(subset=["event"])
         logger.info(f"✅ RSS calendar: {len(df)} high impact events cached")
         return df
 
+    def _is_preview_article(self, text: str) -> bool:
+        """Return True only when the text is a forward-looking preview, not a result."""
+        return any(kw in text for kw in self.PREVIEW_KEYWORDS)
+
     def _detect_currency(self, text: str) -> str:
-        """
-        Detects which currency an article is about.
-        Returns UNKNOWN for unmatched headlines so they
-        do not incorrectly block USD pairs.
-        """
-        for currency, keywords in self.KEYWORD_CURRENCIES.items():
-            if any(kw.lower() in text for kw in keywords):
+        for kw, currency in self.KEYWORD_CURRENCY.items():
+            if kw in text:
                 return currency
         return "UNKNOWN"
 
-    # ── Today's Events Summary ────────────────────────────────────────────────
-    def get_todays_events(self) -> pd.DataFrame:
-        df = self._get_rss_events()
-        if df is None or df.empty:
-            return pd.DataFrame()
-        today = datetime.now(pytz.utc).date()
-        mask  = df["datetime"].apply(
-            lambda x: x.date() == today if hasattr(x, "date") else False
-        )
-        return df[mask].reset_index(drop=True)
+    @staticmethod
+    def _parse_pub_date(entry) -> Optional[datetime]:
+        """Parse feedparser entry date to timezone-aware UTC datetime."""
+        try:
+            import time as time_mod
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                ts = time_mod.mktime(entry.published_parsed)
+                return datetime.fromtimestamp(ts, tz=pytz.utc)
+        except Exception:
+            pass
+        return datetime.now(pytz.utc)
 
-    def print_todays_events(self) -> None:
-        df = self.get_todays_events()
-        print("\n📅 TODAY'S HIGH IMPACT EVENTS")
-        print("=" * 55)
-        if df.empty:
-            print("  ✅ No high impact events today — clear to trade")
-        else:
-            for _, row in df.iterrows():
-                dt = row["datetime"]
-                time_str = (
-                    dt.strftime("%H:%M")
-                    if hasattr(dt, "strftime")
-                    else "??:??"
-                )
-                print(
-                    f"  🔴 {row['currency']:<5} | "
-                    f"{time_str} UTC | "
-                    f"{row['event'][:45]}"
-                )
-        print("=" * 55 + "\n")
-
-    # ── Cache Validity ────────────────────────────────────────────────────────
     def _is_cache_valid(self) -> bool:
-        if self._cache_data is None or self._cache_time is None:
+        if self._cache_time is None or self._cache_df is None:
             return False
-        age_minutes = (datetime.now() - self._cache_time).total_seconds() / 60
-        return age_minutes < self.CACHE_MINUTES
+        age = (datetime.now(pytz.utc) - self._cache_time).total_seconds() / 60
+        return age < self.CACHE_MINUTES
+
+    # ── disabled MT5 method (kept to avoid ImportError elsewhere) ────────────
+    @staticmethod
+    def _get_mt5_events(*_, **__):
+        return None

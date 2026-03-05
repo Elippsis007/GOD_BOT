@@ -67,7 +67,7 @@ class TradingConfig:
 
     # ── ML Model ──────────────────────────────────────────────────────────────
     ML_LOOKBACK:       int   = 60
-    ML_MIN_CONFIDENCE: float = 0.45        # ← CHANGED from 0.50
+    ML_MIN_CONFIDENCE: float = 0.45
     ML_FEATURES: List[str] = field(default_factory=lambda: [
         "ema_fast", "ema_slow", "rsi", "bb_upper", "bb_lower",
         "atr", "macd", "macd_signal", "volume",
@@ -84,7 +84,7 @@ class TradingConfig:
     ])
 
     # ── Signal Score ──────────────────────────────────────────────────────────
-    MIN_SIGNAL_SCORE: int = 3              # ← CHANGED from 4
+    MIN_SIGNAL_SCORE: int = 3
 
     # ── Telegram Alert Flags ──────────────────────────────────────────────────
     TELEGRAM_SEND_SIGNALS: bool = True
@@ -109,16 +109,16 @@ class TradingConfig:
     ALERT_COOLDOWN_NEWS:   int = 3600
 
     # ── Alert Confidence Threshold ────────────────────────────────────────────
-    ALERT_MIN_CONFIDENCE: float = 0.50     # ← CHANGED from 0.70
+    ALERT_MIN_CONFIDENCE: float = 0.50
 
-    # ── Scalper Style ─────────────────────────────────────────────────────────
-    SCALPER_TF_PRIMARY:   int   = 1
-    SCALPER_TF_CONFIRM:   int   = 5
-    SCALPER_TP_PIPS:      float = 7.0
-    SCALPER_SL_PIPS:      float = 4.0
-    SCALPER_MAX_SPREAD:   float = 1.5
-    SCALPER_SCAN_SECS:    int   = 10
-    SCALPER_SIGNAL_SCORE: int   = 3
+    # ── Scalper Style (M5) ────────────────────────────────────────────────────
+    SCALPER_TF_PRIMARY:   int   = 5       # M5 — primary signal timeframe
+    SCALPER_TF_CONFIRM:   int   = 15      # M15 — confirmation timeframe
+    SCALPER_TP_PIPS:      float = 12.0    # M5 needs more room than M1
+    SCALPER_SL_PIPS:      float = 6.0     # M5 needs wider SL than M1
+    SCALPER_MAX_SPREAD:   float = 1.5     # max spread in pips
+    SCALPER_SCAN_SECS:    int   = 30      # scan every 30s, candle every 5min
+    SCALPER_SIGNAL_SCORE: int   = 3       # minimum confluence score
 
     # ── Day Trader Style ──────────────────────────────────────────────────────
     DAYTRADER_TF_PRIMARY:   int   = 900
