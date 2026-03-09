@@ -36,34 +36,23 @@ class SignalEngine:
     Multi-confluence signal engine optimised for M5 scalping.
     Each sub-filter scores +1 (bull) / -1 (bear) / 0 (neutral).
     A signal fires when confluence score >= threshold.
-    8 filters total — max possible score is +8 or -8.
+    9 filters total — max possible score is +9 or -9.
 
-    M5 optimisations vs original:
-      - Filter 1 : EMA stack uses fast/slow only (EMA 9/21);
-                   ema_trend (EMA 50 = 250 min lag) removed from stack check.
-                   Instead ema_trend acts as a directional bias gate only.
-      - Filter 3 : RSI zone boundaries tightened (oversold <35, overbought >65)
-                   so the filter fires more on M5 without waiting for extremes.
-      - Filter 5 : ADX threshold lowered from 25 → 18 so it contributes on
-                   shorter-term M5 trends (ADX 25 almost never fires on M5).
-      - Filter 6 : Stochastic now also scores at extreme zones (<20 / >80)
-                   giving an extra point on strong momentum candles.
-      - Filter 7 : CMF threshold tightened from ±0.1 → ±0.05 so volume
-                   confirmation triggers earlier on M5.
-      - Filter 8 : Squeeze breakout now also checks momentum direction via
-                   last close vs previous close as a fallback when is_bullish
-                   is unavailable.
+    Filter 9 (new): Price Structure — detects higher highs/higher lows (BUY)
+    or lower highs/lower lows (SELL) using the last 6 candles.
+    This replaces ADX as the primary trend confirmation on M5.
     """
 
     # ── M5-tuned indicator periods ────────────────────────────────────────────
-    ADX_THRESHOLD     = 18     # was 25 — fires on M5 trends
-    RSI_BULL_LOW      = 35     # was RSI_OVERSOLD (30) — slightly relaxed
-    RSI_BULL_HIGH     = 60     # unchanged
-    RSI_BEAR_LOW      = 60     # unchanged
-    RSI_BEAR_HIGH     = 65     # was RSI_OVERBOUGHT (70) — slightly tightened
-    CMF_THRESHOLD     = 0.05   # was 0.10 — fires earlier on M5 volume
-    STOCH_BULL_ZONE   = 20     # %K below this = oversold bonus point
-    STOCH_BEAR_ZONE   = 80     # %K above this = overbought bonus point
+    ADX_THRESHOLD     = 18
+    RSI_BULL_LOW      = 35
+    RSI_BULL_HIGH     = 60
+    RSI_BEAR_LOW      = 60
+    RSI_BEAR_HIGH     = 65
+    CMF_THRESHOLD     = 0.05
+    STOCH_BULL_ZONE   = 20
+    STOCH_BEAR_ZONE   = 80
+    STRUCTURE_LOOKBACK = 6   # candles to check for HH/HL or LH/LL
 
     def __init__(self, config=CONFIG, trading_style: str = "scalper"):
         self.cfg           = config
@@ -71,7 +60,6 @@ class SignalEngine:
         self._update_thresholds()
 
     def _update_thresholds(self) -> None:
-        """Sets BULL/BEAR thresholds from config based on trading style."""
         if self.trading_style == "scalper" and hasattr(self.cfg, "SCALPER_SIGNAL_SCORE"):
             self.BULL_THRESHOLD = self.cfg.SCALPER_SIGNAL_SCORE
             self.BEAR_THRESHOLD = self.cfg.SCALPER_SIGNAL_SCORE
@@ -82,13 +70,46 @@ class SignalEngine:
             self.BULL_THRESHOLD = 4
             self.BEAR_THRESHOLD = 4
 
+    def _price_structure(self, df: pd.DataFrame) -> int:
+        """
+        Filter 9 — Price Structure detector.
+        Looks at the last STRUCTURE_LOOKBACK candles and checks for:
+          BUY  (+1): higher highs AND higher lows  (uptrend structure)
+          SELL (-1): lower highs  AND lower lows   (downtrend structure)
+          NEUTRAL (0): mixed / choppy structure
+
+        Uses candle highs and lows directly — no lag, reacts immediately
+        to price action unlike EMA or ADX.
+        """
+        try:
+            window = df.iloc[-(self.STRUCTURE_LOOKBACK + 1):-1]
+            if len(window) < self.STRUCTURE_LOOKBACK:
+                return 0
+
+            highs = window["high"].values
+            lows  = window["low"].values
+
+            # Check last 3 swing highs and lows
+            hh = all(highs[i] > highs[i - 1] for i in range(1, len(highs)))
+            hl = all(lows[i]  > lows[i - 1]  for i in range(1, len(lows)))
+            lh = all(highs[i] < highs[i - 1] for i in range(1, len(highs)))
+            ll = all(lows[i]  < lows[i - 1]  for i in range(1, len(lows)))
+
+            if hh and hl:
+                return 1   # bullish structure
+            elif lh and ll:
+                return -1  # bearish structure
+            else:
+                return 0   # no clear structure
+        except Exception:
+            return 0
+
     def evaluate(
         self, df: pd.DataFrame, symbol: str
     ) -> Optional[TradingSignal]:
         if df is None or len(df) < 2:
             return None
 
-        # ── Normalise column names to lowercase ───────────────────────────────
         df = df.copy()
         df.columns = df.columns.str.lower()
 
@@ -97,10 +118,7 @@ class SignalEngine:
         score = 0
         reasons: list = []
 
-        # ── Filter 1: Trend Alignment (EMA 9/21 stack + EMA 50 bias) ─────────
-        # On M5, EMA 50 = 250 minutes of lag — too slow for crossover logic.
-        # We use EMA 9/21 for the score and EMA 50 only as a directional gate
-        # (adds +0.5 confluece weight by allowing half-point if trend agrees).
+        # ── Filter 1: Trend Alignment (EMA 9/21) ─────────────────────────────
         ema_fast  = last.get("ema_fast",  None)
         ema_slow  = last.get("ema_slow",  None)
         ema_trend = last.get("ema_trend", None)
@@ -120,10 +138,10 @@ class SignalEngine:
                 reasons.append(tag)
 
         # ── Filter 2: MACD Crossover ──────────────────────────────────────────
-        macd       = last.get("macd",        None)
-        macd_sig   = last.get("macd_signal", None)
-        prev_macd  = prev.get("macd",        None)
-        prev_msig  = prev.get("macd_signal", None)
+        macd      = last.get("macd",        None)
+        macd_sig  = last.get("macd_signal", None)
+        prev_macd = prev.get("macd",        None)
+        prev_msig = prev.get("macd_signal", None)
 
         if None not in (macd, macd_sig, prev_macd, prev_msig):
             bull_cross = prev_macd < prev_msig and macd > macd_sig
@@ -134,7 +152,6 @@ class SignalEngine:
             elif bear_cross:
                 score -= 1
                 reasons.append("❌ MACD bearish crossover")
-            # No cross but same side — half-signal via histogram direction
             elif macd > macd_sig and macd > prev_macd:
                 score += 1
                 reasons.append("✅ MACD histogram expanding bullish")
@@ -142,7 +159,7 @@ class SignalEngine:
                 score -= 1
                 reasons.append("❌ MACD histogram expanding bearish")
 
-        # ── Filter 3: RSI Zone (M5-tightened boundaries) ─────────────────────
+        # ── Filter 3: RSI Zone ────────────────────────────────────────────────
         rsi = last.get("rsi", None)
         if rsi is not None:
             if rsi <= self.RSI_BULL_LOW:
@@ -159,10 +176,10 @@ class SignalEngine:
                 reasons.append(f"❌ RSI bearish zone ({rsi:.1f})")
 
         # ── Filter 4: Bollinger Band Position ─────────────────────────────────
-        close     = last.get("close",    None)
-        bb_mid    = last.get("bb_mid",   None)
-        bb_upper  = last.get("bb_upper", None)
-        bb_lower  = last.get("bb_lower", None)
+        close    = last.get("close",    None)
+        bb_mid   = last.get("bb_mid",   None)
+        bb_upper = last.get("bb_upper", None)
+        bb_lower = last.get("bb_lower", None)
 
         if None not in (close, bb_mid, bb_upper, bb_lower):
             if bb_mid < close < bb_upper:
@@ -171,7 +188,6 @@ class SignalEngine:
             elif bb_lower < close < bb_mid:
                 score -= 1
                 reasons.append("❌ Price below BB midline")
-            # Extreme band touches — strong momentum signal
             elif close >= bb_upper:
                 score += 1
                 reasons.append("✅ Price at/above BB upper (strong bull momentum)")
@@ -179,7 +195,7 @@ class SignalEngine:
                 score -= 1
                 reasons.append("❌ Price at/below BB lower (strong bear momentum)")
 
-        # ── Filter 5: ADX Trend Strength (M5-lowered threshold: 18 vs 25) ────
+        # ── Filter 5: ADX Trend Strength ──────────────────────────────────────
         adx    = last.get("adx",    None)
         di_pos = last.get("di_pos", None)
         di_neg = last.get("di_neg", None)
@@ -195,17 +211,15 @@ class SignalEngine:
             else:
                 reasons.append(f"⚠️  ADX weak ({adx:.1f}) — no trend confirmation")
 
-        # ── Filter 6: Stochastic (M5-tuned: scores extreme zones too) ─────────
+        # ── Filter 6: Stochastic ──────────────────────────────────────────────
         stoch_k = last.get("stoch_k", None)
         stoch_d = last.get("stoch_d", None)
 
         if None not in (stoch_k, stoch_d):
             if stoch_k <= self.STOCH_BULL_ZONE:
-                # Oversold extreme — strong buy signal
                 score += 1
                 reasons.append(f"✅ Stochastic oversold ({stoch_k:.1f})")
             elif stoch_k >= self.STOCH_BEAR_ZONE:
-                # Overbought extreme — strong sell signal
                 score -= 1
                 reasons.append(f"❌ Stochastic overbought ({stoch_k:.1f})")
             elif stoch_k > stoch_d and stoch_k < self.STOCH_BEAR_ZONE:
@@ -215,7 +229,7 @@ class SignalEngine:
                 score -= 1
                 reasons.append(f"❌ Stochastic bearish crossdown ({stoch_k:.1f})")
 
-        # ── Filter 7: Volume Confirmation via CMF (M5 threshold: 0.05) ────────
+        # ── Filter 7: CMF Volume ──────────────────────────────────────────────
         cmf = last.get("cmf", None)
         if cmf is not None:
             if cmf > self.CMF_THRESHOLD:
@@ -232,24 +246,32 @@ class SignalEngine:
 
         if squeeze is not None and prev_sq is not None:
             if squeeze == 0 and prev_sq == 1:
-                # Squeeze just released — determine direction
                 if is_bullish is not None:
                     direction = 1 if is_bullish else -1
                 else:
-                    # Fallback: use close-vs-prev-close direction
                     prev_close = prev.get("close", None)
                     if prev_close is not None and close is not None:
                         direction = 1 if close > prev_close else -1
                     else:
                         direction = 0
-
                 if direction != 0:
                     score += direction
                     label = "bullish" if direction == 1 else "bearish"
                     reasons.append(f"⚡ Squeeze breakout ({label})")
 
+        # ── Filter 9: Price Structure (HH/HL or LH/LL) ───────────────────────
+        structure = self._price_structure(df)
+        if structure == 1:
+            score += 1
+            reasons.append("✅ Bullish structure (HH + HL confirmed)")
+        elif structure == -1:
+            score -= 1
+            reasons.append("❌ Bearish structure (LH + LL confirmed)")
+        else:
+            reasons.append("⚠️  No clear price structure")
+
         # ── Determine Signal ───────────────────────────────────────────────────
-        strength = abs(score) / 8.0
+        strength = abs(score) / 9.0
         atr      = last.get("atr",   0.0001)
         entry    = last.get("close", 0.0)
 
@@ -260,23 +282,23 @@ class SignalEngine:
         )
 
         if score >= self.BULL_THRESHOLD:
-            sl          = round(entry - (atr * 1.5),              5)
+            sl          = round(entry - (atr * 1.5),                    5)
             tp          = round(entry + (atr * 1.5 * self.cfg.RR_RATIO), 5)
             signal_type = SignalType.BUY
-            confidence  = round(min(score / 8.0, 1.0), 3)
+            confidence  = round(min(score / 9.0, 1.0), 3)
 
         elif score <= -self.BEAR_THRESHOLD:
-            sl          = round(entry + (atr * 1.5),              5)
+            sl          = round(entry + (atr * 1.5),                    5)
             tp          = round(entry - (atr * 1.5 * self.cfg.RR_RATIO), 5)
             signal_type = SignalType.SELL
-            confidence  = round(min(abs(score) / 8.0, 1.0), 3)
+            confidence  = round(min(abs(score) / 9.0, 1.0), 3)
 
         else:
             logger.debug(
                 f"⛔ Gate 2 BLOCKED — {symbol} score={score} "
                 f"below threshold ±{self.BULL_THRESHOLD}"
             )
-            return None  # confluence too weak — no trade
+            return None
 
         signal = TradingSignal(
             symbol     = symbol,

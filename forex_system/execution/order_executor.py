@@ -30,25 +30,24 @@ def _get_filling_mode(symbol: str) -> int:
         logger.warning(f"symbol_info({symbol}) returned None — defaulting to FOK filling")
         return mt5.ORDER_FILLING_FOK
 
-    filling_flags = info.filling_mode          # bitmask of supported modes
-    if filling_flags & mt5.SYMBOL_FILLING_FOK:
+    filling_flags = info.filling_mode
+    if filling_flags & mt5.ORDER_FILLING_FOK:
         return mt5.ORDER_FILLING_FOK
-    if filling_flags & mt5.SYMBOL_FILLING_IOC:
+    if filling_flags & mt5.ORDER_FILLING_IOC:
         return mt5.ORDER_FILLING_IOC
-    return mt5.ORDER_FILLING_RETURN            # always present as fallback
+    return mt5.ORDER_FILLING_RETURN
 
 
 class OrderExecutor:
 
     MAX_RETRIES = 3
-    RETRY_DELAY = 1.0  # seconds
+    RETRY_DELAY = 1.0
 
     def __init__(self, config=CONFIG):
         self.cfg = config
 
     # ── Market Order ──────────────────────────────────────────────────────────
     def send_market_order(self, spec: PositionSpec) -> Optional[dict]:
-        # FIX: collapse two tick calls into one and add a null guard
         tick = mt5.symbol_info_tick(spec.symbol)
         if tick is None:
             logger.error(f"No tick data for {spec.symbol} — cannot place order")
@@ -71,7 +70,6 @@ class OrderExecutor:
             "magic":         self.cfg.MAGIC_NUMBER,
             "comment":       self.cfg.COMMENT,
             "type_time":     mt5.ORDER_TIME_GTC,
-            # FIX: was hardcoded ORDER_FILLING_IOC — now broker-safe dynamic resolution
             "type_filling":  _get_filling_mode(spec.symbol),
         }
 
@@ -90,7 +88,6 @@ class OrderExecutor:
             return False
         pos = position[0]
 
-        # FIX: added null guards for sym_info and tick
         sym_info = mt5.symbol_info(symbol)
         if sym_info is None:
             logger.warning(f"Trailing stop: symbol_info({symbol}) returned None")
@@ -107,11 +104,11 @@ class OrderExecutor:
         if pos.type == mt5.ORDER_TYPE_BUY:
             new_sl = tick.bid - trail_price
             if new_sl <= pos.sl:
-                return True   # trail hasn't moved forward yet — nothing to do
+                return True
         else:
             new_sl = tick.ask + trail_price
             if new_sl >= pos.sl:
-                return True   # same — no update needed for SELL
+                return True
 
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
@@ -135,7 +132,6 @@ class OrderExecutor:
 
         pos = positions[0]
 
-        # FIX: added null guard on tick
         tick = mt5.symbol_info_tick(pos.symbol)
         if tick is None:
             logger.error(f"No tick for {pos.symbol} — cannot close position {ticket}")
@@ -157,7 +153,6 @@ class OrderExecutor:
             "deviation":     self.cfg.SLIPPAGE,
             "magic":         self.cfg.MAGIC_NUMBER,
             "comment":       f"Close {ticket}",
-            # FIX: was missing type_filling — some brokers reject without it
             "type_filling":  _get_filling_mode(pos.symbol),
         }
 
@@ -176,7 +171,6 @@ class OrderExecutor:
         for attempt in range(1, self.MAX_RETRIES + 1):
             result = mt5.order_send(request)
 
-            # Guard: order_send can return None if terminal is disconnected
             if result is None:
                 logger.error(f"Attempt {attempt}: order_send returned None (terminal disconnected?)")
                 time.sleep(self.RETRY_DELAY)
@@ -201,13 +195,11 @@ class OrderExecutor:
                 }
 
             elif result.retcode == mt5.TRADE_RETCODE_REQUOTE:
-                # Re-fetch live price on requote before retrying
                 tick = mt5.symbol_info_tick(spec.symbol)
                 if tick is None:
                     logger.error(f"Requote: no tick for {spec.symbol} — aborting")
                     break
                 request["price"] = tick.ask if spec.direction == "BUY" else tick.bid
-                # FIX: also refresh the filling mode in case broker state changed
                 request["type_filling"] = _get_filling_mode(spec.symbol)
                 time.sleep(self.RETRY_DELAY)
 

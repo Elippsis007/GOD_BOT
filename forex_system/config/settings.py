@@ -1,4 +1,4 @@
-# config/settings.py
+﻿# config/settings.py
 import os
 from dataclasses import dataclass, field
 from typing import List
@@ -13,40 +13,40 @@ except ImportError:
 @dataclass
 class TradingConfig:
 
-    # ── MT5 Account ───────────────────────────────────────────────────────────
+    # â”€â”€ MT5 Account â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     MT5_LOGIN:    int = field(default_factory=lambda: int(os.getenv("MT5_LOGIN", "62111571")))
     MT5_PASSWORD: str = field(default_factory=lambda: os.getenv("MT5_PASSWORD", "ue.2drzZyq"))
     MT5_SERVER:   str = field(default_factory=lambda: os.getenv("MT5_SERVER",   "PepperstoneUK-Demo"))
     MT5_PATH:     str = field(default_factory=lambda: os.getenv(
-        "MT5_PATH", r"C:\Program Files\StoneX Europe MT5 Terminal\terminal64.exe"
+        "MT5_PATH", r"C:\Program Files\Pepperstone MetaTrader 5\terminal64.exe"
     ))
 
-    # ── Trader Identity ───────────────────────────────────────────────────────
+    # â”€â”€ Trader Identity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     TRADER_NAME:     str = field(default_factory=lambda: os.getenv("TRADER_NAME",     "Michael"))
     TRADER_TIMEZONE: str = field(default_factory=lambda: os.getenv("TRADER_TIMEZONE", "Europe/Madrid"))
 
-    # ── Telegram ──────────────────────────────────────────────────────────────
+    # â”€â”€ Telegram â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     TELEGRAM_TOKEN:   str = field(default_factory=lambda: os.getenv("TELEGRAM_TOKEN",   "8693437372:AAHQm4RwedYLkgKkYTlD5XZACHqMnvHVUBE"))
     TELEGRAM_CHAT_ID: str = field(default_factory=lambda: os.getenv("TELEGRAM_CHAT_ID", "7688107635"))
 
-    # ── Gemini ────────────────────────────────────────────────────────────────
+    # â”€â”€ Gemini â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     GEMINI_API_KEY: str  = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", "AIzaSyBKtwbd1e1M7tLYsMIrmibKTrTGAn01XZM"))
     GEMINI_ENABLED: bool = True
 
-    # ── Watchlist ─────────────────────────────────────────────────────────────
+    # â”€â”€ Watchlist â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     WATCHLIST: List[str] = field(default_factory=lambda: ["EURUSD"])
 
-    # ── Symbols ───────────────────────────────────────────────────────────────
+    # â”€â”€ Symbols â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     SYMBOLS: List[str] = field(default_factory=lambda: [
         "EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD",
     ])
 
-    # ── Timeframes ────────────────────────────────────────────────────────────
+    # â”€â”€ Timeframes â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     PRIMARY_TF:   int = 16385   # H1
     CONFIRM_TF:   int = 16388   # H4
     BARS_HISTORY: int = 1000
 
-    # ── Risk ──────────────────────────────────────────────────────────────────
+    # â”€â”€ Risk â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     RISK_PER_TRADE:     float = 0.01
     MAX_OPEN_TRADES:    int   = 3
     MAX_DAILY_LOSS:     float = 0.03
@@ -54,7 +54,7 @@ class TradingConfig:
     MAX_LOSS_PER_TRADE: float = 50.0
     TRAILING_STOP_PIPS: int   = 15
 
-    # ── Indicators ────────────────────────────────────────────────────────────
+    # â”€â”€ Indicators â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     EMA_FAST:       int   = 9
     EMA_SLOW:       int   = 21
     EMA_TREND:      int   = 50
@@ -68,28 +68,28 @@ class TradingConfig:
     MACD_SLOW:      int   = 26
     MACD_SIGNAL:    int   = 9
 
-    # ── ML Model ──────────────────────────────────────────────────────────────
+    # â”€â”€ ML Model â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ML_LOOKBACK:       int   = 60
-    ML_MIN_CONFIDENCE: float = 0.45
+    ML_MIN_CONFIDENCE: float = 0.35
     ML_FEATURES: List[str] = field(default_factory=lambda: [
         "ema_fast", "ema_slow", "rsi", "bb_upper", "bb_lower",
         "atr", "macd", "macd_signal", "volume",
     ])
 
-    # ── Execution ─────────────────────────────────────────────────────────────
+    # â”€â”€ Execution â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     SLIPPAGE:     int = 20
     MAGIC_NUMBER: int = 202401
     COMMENT:      str = "GODBOT_v1"
 
-    # ── Sessions ──────────────────────────────────────────────────────────────
+    # â”€â”€ Sessions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     TRADE_SESSIONS: List[str] = field(default_factory=lambda: [
         "london", "newyork", "overlap",
     ])
 
-    # ── Signal Score ──────────────────────────────────────────────────────────
+    # â”€â”€ Signal Score â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     MIN_SIGNAL_SCORE: int = 3
 
-    # ── Telegram Alert Flags ──────────────────────────────────────────────────
+    # â”€â”€ Telegram Alert Flags â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     TELEGRAM_SEND_SIGNALS: bool = True
     TELEGRAM_SEND_DANGER:  bool = True
     TELEGRAM_SEND_NEWS:    bool = True
@@ -99,31 +99,31 @@ class TradingConfig:
     TELEGRAM_SEND_HOLD:    bool = False
     TELEGRAM_SEND_EXIT:    bool = False
 
-    # ── Quiet Hours ───────────────────────────────────────────────────────────
+    # â”€â”€ Quiet Hours â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     TELEGRAM_QUIET_ON:    bool = True
     TELEGRAM_QUIET_START: int  = 23
     TELEGRAM_QUIET_END:   int  = 8
 
-    # ── Alert Cooldowns (seconds) ─────────────────────────────────────────────
+    # â”€â”€ Alert Cooldowns (seconds) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     ALERT_COOLDOWN_SIGNAL: int = 300
     ALERT_COOLDOWN_HOLD:   int = 900
     ALERT_COOLDOWN_EXIT:   int = 600
     ALERT_COOLDOWN_DANGER: int = 180
     ALERT_COOLDOWN_NEWS:   int = 3600
 
-    # ── Alert Confidence Threshold ────────────────────────────────────────────
-    ALERT_MIN_CONFIDENCE: float = 0.50
+    # â”€â”€ Alert Confidence Threshold â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    ALERT_MIN_CONFIDENCE: float = 0.35
 
-    # ── Scalper Style (M5) ────────────────────────────────────────────────────
-    SCALPER_TF_PRIMARY:   int   = 5       # M5 — primary signal timeframe
-    SCALPER_TF_CONFIRM:   int   = 15      # M15 — confirmation timeframe
-    SCALPER_TP_PIPS:      float = 12.0    # M5 needs more room than M1
-    SCALPER_SL_PIPS:      float = 6.0     # M5 needs wider SL than M1
-    SCALPER_MAX_SPREAD:   float = 1.5     # max spread in pips
-    SCALPER_SCAN_SECS:    int   = 30      # scan every 30s, candle every 5min
-    SCALPER_SIGNAL_SCORE: int   = 5       # minimum confluence score
+    # â”€â”€ Scalper Style (M5) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    SCALPER_TF_PRIMARY:   int   = 5       # M5 â€” primary signal timeframe
+    SCALPER_TF_CONFIRM:   int   = 15      # M15 â€” confirmation timeframe
+    SCALPER_TP_PIPS:      float = 12.0
+    SCALPER_SL_PIPS:      float = 6.0
+    SCALPER_MAX_SPREAD:   float = 2.0
+    SCALPER_SCAN_SECS:    int   = 30
+    SCALPER_SIGNAL_SCORE: int   = 3
 
-    # ── Day Trader Style ──────────────────────────────────────────────────────
+    # â”€â”€ Day Trader Style â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     DAYTRADER_TF_PRIMARY:   int   = 900
     DAYTRADER_TF_CONFIRM:   int   = 16385
     DAYTRADER_TP_PIPS:      float = 30.0
@@ -132,20 +132,20 @@ class TradingConfig:
     DAYTRADER_SCAN_SECS:    int   = 60
     DAYTRADER_SIGNAL_SCORE: int   = 4
 
-    # ── Session Times (CET hour) ──────────────────────────────────────────────
+    # â”€â”€ Session Times (CET hour) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     LONDON_OPEN_CET: int = 8
     NY_CLOSE_CET:    int = 23
     OVERLAP_START:   int = 14
     OVERLAP_END:     int = 17
 
-    # ── Profile File ──────────────────────────────────────────────────────────
+    # â”€â”€ Profile File â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     PROFILE_FILE: str = "data/profile.json"
 
 
-# ── Single global instance ────────────────────────────────────────────────────
+# â”€â”€ Single global instance â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 CONFIG = TradingConfig()
 
-# ── Module-level aliases ──────────────────────────────────────────────────────
+# â”€â”€ Module-level aliases â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 PROFILE_FILE           = CONFIG.PROFILE_FILE
 TRADER_NAME            = CONFIG.TRADER_NAME
 TRADER_TIMEZONE        = CONFIG.TRADER_TIMEZONE
@@ -169,3 +169,4 @@ LONDON_OPEN_CET        = CONFIG.LONDON_OPEN_CET
 NY_CLOSE_CET           = CONFIG.NY_CLOSE_CET
 OVERLAP_START          = CONFIG.OVERLAP_START
 OVERLAP_END            = CONFIG.OVERLAP_END
+

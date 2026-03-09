@@ -1,4 +1,4 @@
-# main.py – GODBOT v3.0
+﻿# main.py — GODBOT v3.0
 import os
 import tempfile
 
@@ -172,12 +172,10 @@ class ForexSystem:
         self.intermarket = IntermarketAnalyzer()
         self.cot         = COTReader()
 
-        # Wire risk manager to alert system
         self.risk_mgr.set_alerts(self.alerts)
-
         self._start_keyboard_listener()
 
-    # ── startup ───────────────────────────────────────────────────────────────
+    # ── startup ──────────────────────────────────────────────────────────────
     def start(self) -> None:
         if not self.connector.connect():
             raise RuntimeError("Cannot connect to MT5 — is the terminal open?")
@@ -282,7 +280,7 @@ class ForexSystem:
         for symbol in CONFIG.WATCHLIST:
             self._process_symbol(symbol)
 
-    # ── per-symbol processing (replaces _process_eurusd) ─────────────────────
+    # ── per-symbol processing ─────────────────────────────────────────────────
     def _process_symbol(self, symbol: str) -> None:
         tf = SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY
 
@@ -339,8 +337,8 @@ class ForexSystem:
             f"Strength={signal.strength:.2f} | Conf={signal.confidence:.0%}"
         )
 
-        # ── Gate 3 — ML ───────────────────────────────────────────────────────
-        ml           = self.ml_model.predict(df, symbol)
+        # ── Gate 3 — ML (direction check temporarily bypassed) ───────────────
+        ml = self.ml_model.predict(df)
         ml_direction = ML_LABEL_MAP.get(ml["label"], str(ml["label"]))
 
         logger.debug(
@@ -353,12 +351,8 @@ class ForexSystem:
             f"SELL={ml['probabilities']['SELL']:.0%}"
         )
 
-        if ml_direction != signal.signal.value:
-            logger.debug(
-                f"[{symbol}] ⛔ Gate 3 BLOCKED — ML disagrees: "
-                f"ML={ml_direction} vs Signal={signal.signal.value}"
-            )
-            return
+        # NOTE: ML direction veto temporarily disabled — retrain scheduled
+        # Only block if ML confidence is below minimum threshold
         if ml["confidence"] < CONFIG.ML_MIN_CONFIDENCE:
             logger.debug(
                 f"[{symbol}] ⛔ Gate 3 BLOCKED — ML confidence too low: "
@@ -370,7 +364,7 @@ class ForexSystem:
             f"[{symbol}] ✅ Gate 3 PASSED — ML={ml_direction} Conf={ml['confidence']:.0%}"
         )
 
-        # ── Gate 4 — Sentiment (Day Trader only) ──────────────────────────────
+        # ── Gate 4 — Sentiment (Day Trader only) ─────────────────────────────
         if self.style == "scalper":
             logger.debug(f"[{symbol}] ⏭️  Gate 4 SKIPPED — Scalper mode")
         else:
@@ -401,7 +395,7 @@ class ForexSystem:
                 return
             logger.debug(f"[{symbol}] ✅ Gate 5 PASSED — Intermarket {inter['score']:+.3f}")
 
-        # ── Gate 6 — COT (Day Trader only) ────────────────────────────────────
+        # ── Gate 6 — COT (Day Trader only) ───────────────────────────────────
         if self.style == "scalper":
             logger.debug(f"[{symbol}] ⏭️  Gate 6 SKIPPED — Scalper mode")
         else:

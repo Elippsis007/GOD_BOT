@@ -1,0 +1,8 @@
+f = open('main.py', 'r', encoding='utf-8')
+content = f.read()
+f.close()
+content = content.replace("if ml['direction'] != signal.signal and ml['confidence'] >= 0.50:", "if False:  # Gate 3 temporarily disabled")
+f = open('main.py', 'w', encoding='utf-8')
+f.write(content)
+f.close()
+print('Done')
