@@ -1,4 +1,3 @@
-# Rule-based signal generator
 # signals/signal_engine.py
 import pandas as pd
 import numpy as np
@@ -33,53 +32,228 @@ class TradingSignal:
 
 class SignalEngine:
     """
-    Multi-confluence signal engine optimised for M5 scalping.
-    Each sub-filter scores +1 (bull) / -1 (bear) / 0 (neutral).
-    A signal fires when confluence score >= threshold.
-    9 filters total — max possible score is +9 or -9.
+    Multi-confluence signal engine with dynamic M1 / M5 profile support.
 
-    Filter 9 (new): Price Structure — detects higher highs/higher lows (BUY)
-    or lower highs/lower lows (SELL) using the last 6 candles.
-    This replaces ADX as the primary trend confirmation on M5.
+    Each sub-filter scores +1 (bull) / -1 (bear) / 0 (neutral).
+    A signal fires when confluence score >= threshold (profile-dependent).
+    9 filters total — max possible score ±9.
+
+    SL / TP calculation (updated):
+      - Base distance = ATR × 1.5  (adaptive to current volatility)
+      - Hard cap      = profile sl_pips / tp_pips  (from settings.py)
+      - Final distance = min(ATR-based, pip cap)
+      - This means SL/TP tighten during low volatility and are always
+        capped at the configured pip maximums during high volatility.
+      - JPY pairs use pip_size = 0.01; all others use 0.0001.
+      - RR ratio applied to TP: tp_dist = sl_dist × RR_RATIO.
+
+    Profile is loaded from CONFIG.get_scalper_profile() at init and can be
+    reloaded at any time by calling reload_profile().
+
+    Filter list
+    -----------
+    1. EMA trend alignment (fast vs slow vs trend)
+    2. MACD crossover / histogram expansion
+    3. RSI zone (oversold / overbought / momentum zone)
+    4. Bollinger Band position
+    5. ADX trend strength + DI direction
+    6. Stochastic oversold / overbought / crossover
+    7. CMF volume pressure
+    8. Volatility squeeze breakout
+    9. Price structure — HH/HL (bull) or LH/LL (bear)
     """
 
-    # ── M5-tuned indicator periods ────────────────────────────────────────────
-    ADX_THRESHOLD     = 18
-    RSI_BULL_LOW      = 35
-    RSI_BULL_HIGH     = 60
-    RSI_BEAR_LOW      = 60
-    RSI_BEAR_HIGH     = 65
-    CMF_THRESHOLD     = 0.05
-    STOCH_BULL_ZONE   = 20
-    STOCH_BEAR_ZONE   = 80
-    STRUCTURE_LOOKBACK = 6   # candles to check for HH/HL or LH/LL
+    # ── Fallback constants (used only if profile load fails) ──────────────────
+    _FALLBACK = {
+        "adx_threshold":   20,
+        "rsi_overbought":  75,
+        "rsi_oversold":    25,
+        "rsi_bull_low":    35,
+        "rsi_bull_high":   60,
+        "rsi_bear_low":    60,
+        "rsi_bear_high":   75,
+        "cmf_threshold":   0.05,
+        "stoch_bull_zone": 25,
+        "stoch_bear_zone": 75,
+        "signal_score":    4,
+        "sl_pips":         6.0,
+        "tp_pips":         12.0,
+    }
+
+    STRUCTURE_LOOKBACK = 6   # candles used by Filter 9
 
     def __init__(self, config=CONFIG, trading_style: str = "scalper"):
         self.cfg           = config
         self.trading_style = trading_style
         self._update_thresholds()
 
+    # ── Profile loader ────────────────────────────────────────────────────────
     def _update_thresholds(self) -> None:
-        if self.trading_style == "scalper" and hasattr(self.cfg, "SCALPER_SIGNAL_SCORE"):
-            self.BULL_THRESHOLD = self.cfg.SCALPER_SIGNAL_SCORE
-            self.BEAR_THRESHOLD = self.cfg.SCALPER_SIGNAL_SCORE
-        elif self.trading_style == "daytrader" and hasattr(self.cfg, "DAYTRADER_SIGNAL_SCORE"):
-            self.BULL_THRESHOLD = self.cfg.DAYTRADER_SIGNAL_SCORE
-            self.BEAR_THRESHOLD = self.cfg.DAYTRADER_SIGNAL_SCORE
-        else:
-            self.BULL_THRESHOLD = 4
-            self.BEAR_THRESHOLD = 4
+        """
+        Load indicator thresholds and SL/TP pip caps from the active profile.
 
+        - scalper   → CONFIG.get_scalper_profile() (M1 or M5)
+        - daytrader → CONFIG day-trader fields
+        - fallback  → _FALLBACK dict
+        """
+        if self.trading_style == "scalper":
+            try:
+                p  = self.cfg.get_scalper_profile()
+                tf = p.get("tf_primary", 5)
+                logger.info(
+                    f"⚙️  SignalEngine loading scalper profile "
+                    f"M{tf} from CONFIG.get_scalper_profile()"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"⚠️  Could not load scalper profile ({exc}); "
+                    "using fallback thresholds"
+                )
+                p = {}
+
+            fb = self._FALLBACK
+            self.ADX_THRESHOLD     = p.get("adx_threshold",   fb["adx_threshold"])
+            self.RSI_OVERBOUGHT    = p.get("rsi_overbought",  fb["rsi_overbought"])
+            self.RSI_OVERSOLD      = p.get("rsi_oversold",    fb["rsi_oversold"])
+            self.RSI_BULL_LOW      = p.get("rsi_bull_low",    fb["rsi_bull_low"])
+            self.RSI_BULL_HIGH     = p.get("rsi_bull_high",   fb["rsi_bull_high"])
+            self.RSI_BEAR_LOW      = p.get("rsi_bear_low",    fb["rsi_bear_low"])
+            self.RSI_BEAR_HIGH     = p.get("rsi_bear_high",   fb["rsi_bear_high"])
+            self.CMF_THRESHOLD     = p.get("cmf_threshold",   fb["cmf_threshold"])
+            self.STOCH_BULL_ZONE   = p.get("stoch_bull_zone", fb["stoch_bull_zone"])
+            self.STOCH_BEAR_ZONE   = p.get("stoch_bear_zone", fb["stoch_bear_zone"])
+            self.BULL_THRESHOLD    = p.get("signal_score",    fb["signal_score"])
+            self.BEAR_THRESHOLD    = self.BULL_THRESHOLD
+            # ── SL/TP pip caps from profile ───────────────────────────────
+            self.SL_PIPS           = p.get("sl_pips",         fb["sl_pips"])
+            self.TP_PIPS           = p.get("tp_pips",         fb["tp_pips"])
+
+        elif self.trading_style == "daytrader":
+            try:
+                self.ADX_THRESHOLD   = getattr(self.cfg, "DAYTRADER_ADX_THRESHOLD",  25)
+                self.RSI_OVERBOUGHT  = getattr(self.cfg, "DAYTRADER_RSI_OVERBOUGHT",  70)
+                self.RSI_OVERSOLD    = getattr(self.cfg, "DAYTRADER_RSI_OVERSOLD",    30)
+                self.RSI_BULL_LOW    = getattr(self.cfg, "DAYTRADER_RSI_BULL_LOW",    40)
+                self.RSI_BULL_HIGH   = getattr(self.cfg, "DAYTRADER_RSI_BULL_HIGH",   60)
+                self.RSI_BEAR_LOW    = getattr(self.cfg, "DAYTRADER_RSI_BEAR_LOW",    60)
+                self.RSI_BEAR_HIGH   = getattr(self.cfg, "DAYTRADER_RSI_BEAR_HIGH",   70)
+                self.CMF_THRESHOLD   = getattr(self.cfg, "DAYTRADER_CMF_THRESHOLD",  0.05)
+                self.STOCH_BULL_ZONE = getattr(self.cfg, "DAYTRADER_STOCH_BULL_ZONE", 20)
+                self.STOCH_BEAR_ZONE = getattr(self.cfg, "DAYTRADER_STOCH_BEAR_ZONE", 80)
+                self.BULL_THRESHOLD  = getattr(self.cfg, "DAYTRADER_SIGNAL_SCORE",     4)
+                self.BEAR_THRESHOLD  = self.BULL_THRESHOLD
+                self.SL_PIPS         = getattr(self.cfg, "DAYTRADER_SL_PIPS",         15.0)
+                self.TP_PIPS         = getattr(self.cfg, "DAYTRADER_TP_PIPS",         30.0)
+                logger.info("⚙️  SignalEngine loaded day-trader profile")
+            except Exception as exc:
+                logger.warning(
+                    f"⚠️  Day-trader profile load failed ({exc}); using fallback"
+                )
+                self._apply_fallback()
+
+        else:
+            self._apply_fallback()
+
+    def _apply_fallback(self) -> None:
+        fb = self._FALLBACK
+        self.ADX_THRESHOLD     = fb["adx_threshold"]
+        self.RSI_OVERBOUGHT    = fb["rsi_overbought"]
+        self.RSI_OVERSOLD      = fb["rsi_oversold"]
+        self.RSI_BULL_LOW      = fb["rsi_bull_low"]
+        self.RSI_BULL_HIGH     = fb["rsi_bull_high"]
+        self.RSI_BEAR_LOW      = fb["rsi_bear_low"]
+        self.RSI_BEAR_HIGH     = fb["rsi_bear_high"]
+        self.CMF_THRESHOLD     = fb["cmf_threshold"]
+        self.STOCH_BULL_ZONE   = fb["stoch_bull_zone"]
+        self.STOCH_BEAR_ZONE   = fb["stoch_bear_zone"]
+        self.BULL_THRESHOLD    = fb["signal_score"]
+        self.BEAR_THRESHOLD    = fb["signal_score"]
+        self.SL_PIPS           = fb["sl_pips"]
+        self.TP_PIPS           = fb["tp_pips"]
+        logger.warning("⚙️  SignalEngine using fallback thresholds")
+
+    def reload_profile(self) -> None:
+        """
+        Call this after changing CONFIG.SCALPER_TF_SELECTED at runtime
+        so all filter thresholds and SL/TP caps are immediately updated.
+        """
+        self._update_thresholds()
+        logger.info(
+            f"🔄 SignalEngine profile reloaded "
+            f"(style={self.trading_style}, "
+            f"TF={getattr(self.cfg, 'SCALPER_TF_SELECTED', '?')})"
+        )
+
+    # ── SL/TP calculator ──────────────────────────────────────────────────────
+    def _calc_sl_tp(
+        self,
+        entry:     float,
+        atr:       float,
+        symbol:    str,
+        direction: str,          # "BUY" or "SELL"
+    ) -> tuple:
+        """
+        Calculate SL and TP with two-layer logic:
+
+        Layer 1 — ATR-based (adaptive):
+            sl_dist = ATR × 1.5
+            tp_dist = sl_dist × RR_RATIO
+
+        Layer 2 — Pip cap (from active profile):
+            sl_dist = min(ATR-based, SL_PIPS × pip_size)
+            tp_dist = min(ATR-based TP, TP_PIPS × pip_size)
+
+        The smaller of the two distances is used so the SL/TP tightens
+        with low volatility but never exceeds the configured pip maximum.
+        TP is then recomputed as sl_dist × RR_RATIO to preserve the
+        risk-reward ratio regardless of which layer wins.
+
+        JPY pairs: pip_size = 0.01
+        All others: pip_size = 0.0001
+
+        Returns (sl: float, tp: float).
+        """
+        pip_size = 0.01 if "JPY" in symbol.upper() else 0.0001
+
+        # Layer 1 — ATR-based distances
+        atr_sl_dist = atr * 1.5
+        atr_tp_dist = atr_sl_dist * self.cfg.RR_RATIO
+
+        # Layer 2 — Pip cap distances
+        cap_sl_dist = self.SL_PIPS * pip_size
+        cap_tp_dist = self.TP_PIPS * pip_size
+
+        # Final distances — take the tighter of ATR vs pip cap
+        sl_dist = min(atr_sl_dist, cap_sl_dist)
+        tp_dist = min(atr_tp_dist, cap_tp_dist)
+
+        # Recompute TP from final SL distance to maintain RR ratio
+        # (ensures TP is always SL_dist × RR even if ATR cap was applied)
+        tp_dist = sl_dist * self.cfg.RR_RATIO
+
+        if direction == "BUY":
+            sl = round(entry - sl_dist, 5)
+            tp = round(entry + tp_dist, 5)
+        else:  # SELL
+            sl = round(entry + sl_dist, 5)
+            tp = round(entry - tp_dist, 5)
+
+        logger.debug(
+            f"_calc_sl_tp [{direction}] {symbol} | "
+            f"entry={entry:.5f} ATR={atr:.5f} | "
+            f"atr_sl={atr_sl_dist:.5f} cap_sl={cap_sl_dist:.5f} → "
+            f"sl_dist={sl_dist:.5f} ({sl_dist/pip_size:.1f} pips) | "
+            f"tp_dist={tp_dist:.5f} ({tp_dist/pip_size:.1f} pips) | "
+            f"SL={sl:.5f} TP={tp:.5f} | RR={self.cfg.RR_RATIO}"
+        )
+
+        return sl, tp
+
+    # ── Filter 9: Price Structure ─────────────────────────────────────────────
     def _price_structure(self, df: pd.DataFrame) -> int:
         """
-        Filter 9 — Price Structure detector.
-        Looks at the last STRUCTURE_LOOKBACK candles and checks for:
-          BUY  (+1): higher highs AND higher lows  (uptrend structure)
-          SELL (-1): lower highs  AND lower lows   (downtrend structure)
-          NEUTRAL (0): mixed / choppy structure
-
-        Uses candle highs and lows directly — no lag, reacts immediately
-        to price action unlike EMA or ADX.
+        Detects HH+HL (bull, +1) or LH+LL (bear, -1) over the last
+        STRUCTURE_LOOKBACK candles.  Returns 0 for choppy structure.
         """
         try:
             window = df.iloc[-(self.STRUCTURE_LOOKBACK + 1):-1]
@@ -89,21 +263,21 @@ class SignalEngine:
             highs = window["high"].values
             lows  = window["low"].values
 
-            # Check last 3 swing highs and lows
             hh = all(highs[i] > highs[i - 1] for i in range(1, len(highs)))
             hl = all(lows[i]  > lows[i - 1]  for i in range(1, len(lows)))
             lh = all(highs[i] < highs[i - 1] for i in range(1, len(highs)))
             ll = all(lows[i]  < lows[i - 1]  for i in range(1, len(lows)))
 
             if hh and hl:
-                return 1   # bullish structure
+                return  1
             elif lh and ll:
-                return -1  # bearish structure
+                return -1
             else:
-                return 0   # no clear structure
+                return  0
         except Exception:
             return 0
 
+    # ── Main evaluation ───────────────────────────────────────────────────────
     def evaluate(
         self, df: pd.DataFrame, symbol: str
     ) -> Optional[TradingSignal]:
@@ -118,7 +292,7 @@ class SignalEngine:
         score = 0
         reasons: list = []
 
-        # ── Filter 1: Trend Alignment (EMA 9/21) ─────────────────────────────
+        # ── Filter 1: Trend Alignment (EMA fast / slow / trend) ───────────────
         ema_fast  = last.get("ema_fast",  None)
         ema_slow  = last.get("ema_slow",  None)
         ema_trend = last.get("ema_trend", None)
@@ -126,18 +300,18 @@ class SignalEngine:
         if ema_fast is not None and ema_slow is not None:
             if ema_fast > ema_slow:
                 score += 1
-                tag = "✅ EMA 9>21 bullish"
+                tag = "✅ EMA fast>slow bullish"
                 if ema_trend is not None and ema_fast > ema_trend:
                     tag += " + trend aligned"
                 reasons.append(tag)
             elif ema_fast < ema_slow:
                 score -= 1
-                tag = "❌ EMA 9<21 bearish"
+                tag = "❌ EMA fast<slow bearish"
                 if ema_trend is not None and ema_fast < ema_trend:
                     tag += " + trend aligned"
                 reasons.append(tag)
 
-        # ── Filter 2: MACD Crossover ──────────────────────────────────────────
+        # ── Filter 2: MACD Crossover / Histogram ──────────────────────────────
         macd      = last.get("macd",        None)
         macd_sig  = last.get("macd_signal", None)
         prev_macd = prev.get("macd",        None)
@@ -162,16 +336,16 @@ class SignalEngine:
         # ── Filter 3: RSI Zone ────────────────────────────────────────────────
         rsi = last.get("rsi", None)
         if rsi is not None:
-            if rsi <= self.RSI_BULL_LOW:
+            if rsi <= self.RSI_OVERSOLD:
                 score += 1
-                reasons.append(f"✅ RSI oversold ({rsi:.1f})")
-            elif self.RSI_BULL_LOW < rsi < self.RSI_BULL_HIGH:
+                reasons.append(f"✅ RSI oversold ({rsi:.1f} ≤ {self.RSI_OVERSOLD})")
+            elif self.RSI_OVERSOLD < rsi < self.RSI_BULL_HIGH:
                 score += 1
                 reasons.append(f"✅ RSI bullish zone ({rsi:.1f})")
-            elif rsi >= self.RSI_BEAR_HIGH:
+            elif rsi >= self.RSI_OVERBOUGHT:
                 score -= 1
-                reasons.append(f"❌ RSI overbought ({rsi:.1f})")
-            elif self.RSI_BEAR_LOW < rsi < self.RSI_BEAR_HIGH:
+                reasons.append(f"❌ RSI overbought ({rsi:.1f} ≥ {self.RSI_OVERBOUGHT})")
+            elif self.RSI_BEAR_LOW < rsi < self.RSI_OVERBOUGHT:
                 score -= 1
                 reasons.append(f"❌ RSI bearish zone ({rsi:.1f})")
 
@@ -204,12 +378,21 @@ class SignalEngine:
             if adx > self.ADX_THRESHOLD:
                 if di_pos > di_neg:
                     score += 1
-                    reasons.append(f"✅ Uptrend confirmed ADX={adx:.1f}")
+                    reasons.append(
+                        f"✅ Uptrend confirmed ADX={adx:.1f} "
+                        f"(threshold {self.ADX_THRESHOLD})"
+                    )
                 else:
                     score -= 1
-                    reasons.append(f"❌ Downtrend confirmed ADX={adx:.1f}")
+                    reasons.append(
+                        f"❌ Downtrend confirmed ADX={adx:.1f} "
+                        f"(threshold {self.ADX_THRESHOLD})"
+                    )
             else:
-                reasons.append(f"⚠️  ADX weak ({adx:.1f}) — no trend confirmation")
+                reasons.append(
+                    f"⚠️  ADX weak ({adx:.1f} < {self.ADX_THRESHOLD}) "
+                    "— no trend confirmation"
+                )
 
         # ── Filter 6: Stochastic ──────────────────────────────────────────────
         stoch_k = last.get("stoch_k", None)
@@ -218,26 +401,40 @@ class SignalEngine:
         if None not in (stoch_k, stoch_d):
             if stoch_k <= self.STOCH_BULL_ZONE:
                 score += 1
-                reasons.append(f"✅ Stochastic oversold ({stoch_k:.1f})")
+                reasons.append(
+                    f"✅ Stochastic oversold ({stoch_k:.1f} ≤ {self.STOCH_BULL_ZONE})"
+                )
             elif stoch_k >= self.STOCH_BEAR_ZONE:
                 score -= 1
-                reasons.append(f"❌ Stochastic overbought ({stoch_k:.1f})")
+                reasons.append(
+                    f"❌ Stochastic overbought ({stoch_k:.1f} ≥ {self.STOCH_BEAR_ZONE})"
+                )
             elif stoch_k > stoch_d and stoch_k < self.STOCH_BEAR_ZONE:
                 score += 1
-                reasons.append(f"✅ Stochastic bullish crossup ({stoch_k:.1f})")
+                reasons.append(
+                    f"✅ Stochastic bullish crossup ({stoch_k:.1f})"
+                )
             elif stoch_k < stoch_d and stoch_k > self.STOCH_BULL_ZONE:
                 score -= 1
-                reasons.append(f"❌ Stochastic bearish crossdown ({stoch_k:.1f})")
+                reasons.append(
+                    f"❌ Stochastic bearish crossdown ({stoch_k:.1f})"
+                )
 
         # ── Filter 7: CMF Volume ──────────────────────────────────────────────
         cmf = last.get("cmf", None)
         if cmf is not None:
             if cmf > self.CMF_THRESHOLD:
                 score += 1
-                reasons.append(f"✅ Positive CMF={cmf:.3f} (buying pressure)")
+                reasons.append(
+                    f"✅ Positive CMF={cmf:.3f} "
+                    f"(> {self.CMF_THRESHOLD} buying pressure)"
+                )
             elif cmf < -self.CMF_THRESHOLD:
                 score -= 1
-                reasons.append(f"❌ Negative CMF={cmf:.3f} (selling pressure)")
+                reasons.append(
+                    f"❌ Negative CMF={cmf:.3f} "
+                    f"(< -{self.CMF_THRESHOLD} selling pressure)"
+                )
 
         # ── Filter 8: Volatility Squeeze Breakout ─────────────────────────────
         squeeze    = last.get("squeeze",    None)
@@ -250,10 +447,12 @@ class SignalEngine:
                     direction = 1 if is_bullish else -1
                 else:
                     prev_close = prev.get("close", None)
-                    if prev_close is not None and close is not None:
-                        direction = 1 if close > prev_close else -1
-                    else:
-                        direction = 0
+                    direction  = (
+                        1 if (prev_close is not None and close is not None
+                              and close > prev_close)
+                        else -1 if (prev_close is not None and close is not None)
+                        else 0
+                    )
                 if direction != 0:
                     score += direction
                     label = "bullish" if direction == 1 else "bearish"
@@ -270,26 +469,27 @@ class SignalEngine:
         else:
             reasons.append("⚠️  No clear price structure")
 
-        # ── Determine Signal ───────────────────────────────────────────────────
+        # ── Determine Signal ──────────────────────────────────────────────────
         strength = abs(score) / 9.0
-        atr      = last.get("atr",   0.0001)
-        entry    = last.get("close", 0.0)
+        atr      = float(last.get("atr",   0.0001))
+        entry    = float(last.get("close", 0.0))
 
         logger.debug(
             f"📊 {symbol} score={score} "
             f"(threshold ±{self.BULL_THRESHOLD}) | "
+            f"style={self.trading_style} | "
+            f"TF=M{getattr(self.cfg, 'SCALPER_TF_SELECTED', '?')} | "
+            f"SL_PIPS={self.SL_PIPS} TP_PIPS={self.TP_PIPS} | "
             f"filters: {' | '.join(reasons)}"
         )
 
         if score >= self.BULL_THRESHOLD:
-            sl          = round(entry - (atr * 1.5),                    5)
-            tp          = round(entry + (atr * 1.5 * self.cfg.RR_RATIO), 5)
+            sl, tp      = self._calc_sl_tp(entry, atr, symbol, "BUY")
             signal_type = SignalType.BUY
             confidence  = round(min(score / 9.0, 1.0), 3)
 
         elif score <= -self.BEAR_THRESHOLD:
-            sl          = round(entry + (atr * 1.5),                    5)
-            tp          = round(entry - (atr * 1.5 * self.cfg.RR_RATIO), 5)
+            sl, tp      = self._calc_sl_tp(entry, atr, symbol, "SELL")
             signal_type = SignalType.SELL
             confidence  = round(min(abs(score) / 9.0, 1.0), 3)
 
@@ -315,7 +515,11 @@ class SignalEngine:
 
         logger.info(
             f"🎯 Signal [{signal_type.value}] on {symbol} | "
-            f"Score={score} | Conf={confidence:.0%} | "
-            f"Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f}"
+            f"Score={score}/{self.BULL_THRESHOLD} | "
+            f"Conf={confidence:.0%} | "
+            f"Entry={entry:.5f} SL={sl:.5f} TP={tp:.5f} | "
+            f"Style={self.trading_style} "
+            f"TF=M{getattr(self.cfg, 'SCALPER_TF_SELECTED', '?')} | "
+            f"SL={self.SL_PIPS}pip cap TP={self.TP_PIPS}pip cap"
         )
         return signal

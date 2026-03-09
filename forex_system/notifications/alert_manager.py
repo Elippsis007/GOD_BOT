@@ -16,7 +16,37 @@ class AlertManager:
     Every alert in the system goes through here.
     Fires Terminal + Sound + Telegram simultaneously.
     Never duplicates the same alert twice.
+
+    FIX — Duplicate alert deduplication key:
+        buy_signal() and sell_signal() previously keyed on the raw
+        entry price (e.g. "buy_EURUSD_1.08423").  A 1-pip move between
+        two calls for the same signal produced a different key and
+        bypassed the cooldown, firing duplicate alerts.
+
+        Fix:
+          - Entry price is rounded to DEDUP_PRICE_DIGITS decimal places
+            before inclusion in the key so small price movements within
+            the same pip bucket are treated as the same alert.
+          - DEDUP_PRICE_DIGITS = 3 groups prices within a 0.001 bucket
+            (~10 pips for major FX pairs) which is comfortably within
+            any reasonable cooldown window.
+          - Direction is preserved in the key so a genuine signal
+            reversal (BUY → SELL at the same rounded price) still fires.
+
+    FIX — Mixed naive/aware datetimes in _already_alerted():
+        The original stored naive datetime.now() in self._alerted but
+        the rest of the class used timezone-aware datetimes via
+        self.timezone.  On machines where the local timezone is not
+        Madrid this caused silent comparison errors.  All datetime
+        usage in _already_alerted() is now consistently timezone-aware
+        (Europe/Madrid).
     """
+
+    # ── Deduplication precision ───────────────────────────────────────────────
+    # Entry price is rounded to this many decimal places when building
+    # the dedup key.  3 d.p. = 0.001 bucket (~10 pips for major pairs).
+    # Increase to 4 for tighter dedup (1-pip bucket) if preferred.
+    DEDUP_PRICE_DIGITS = 3
 
     def __init__(self):
         self.sound    = SoundAlerts()
@@ -28,15 +58,45 @@ class AlertManager:
     def _now(self) -> str:
         return datetime.now(self.timezone).strftime("%H:%M — %d %b")
 
+    def _now_aware(self) -> datetime:
+        """
+        FIX — Returns the current time as a timezone-aware datetime
+        (Europe/Madrid) for consistent use inside _already_alerted().
+        Replaces bare datetime.now() which returned a naive datetime
+        and caused silent comparison failures on non-Madrid systems.
+        """
+        return datetime.now(pytz.utc).astimezone(self.timezone)
+
     # ── Duplicate Guard ───────────────────────────────────────────────────────
     def _already_alerted(self, key: str, minutes: int = 5) -> bool:
-        """Prevents the same alert firing repeatedly within cooldown window."""
+        """
+        Prevents the same alert firing repeatedly within cooldown window.
+
+        FIX — Now uses timezone-aware datetimes consistently so the age
+        calculation is correct regardless of the host machine's local
+        timezone setting.
+        """
         if key in self._alerted:
-            age = (datetime.now() - self._alerted[key]).total_seconds() / 60
+            age = (self._now_aware() - self._alerted[key]).total_seconds() / 60
             if age < minutes:
                 return True
-        self._alerted[key] = datetime.now()
+        # Record or refresh the timestamp for this key
+        self._alerted[key] = self._now_aware()
         return False
+
+    # ── Dedup Key Helper ──────────────────────────────────────────────────────
+    def _price_key(self, price: float) -> str:
+        """
+        FIX — Round price to DEDUP_PRICE_DIGITS decimal places so minor
+        tick-level movements between successive calls for the same signal
+        do not produce a different dedup key and bypass the cooldown.
+
+        Example with DEDUP_PRICE_DIGITS = 3:
+            1.08423  →  "1.084"
+            1.08431  →  "1.084"   (same key — cooldown applies)
+            1.08501  →  "1.085"   (different key — genuine new level)
+        """
+        return str(round(price, self.DEDUP_PRICE_DIGITS))
 
     # ── BUY Signal ────────────────────────────────────────────────────────────
     def buy_signal(
@@ -50,7 +110,8 @@ class AlertManager:
         style:      str,
         atr:        float,
     ):
-        key = f"buy_{symbol}_{entry}"
+        # FIX: key uses rounded price so 1-pip movements don't bypass cooldown
+        key = f"buy_{symbol}_{self._price_key(entry)}"
         if self._already_alerted(key):
             return
 
@@ -99,7 +160,8 @@ class AlertManager:
         style:      str,
         atr:        float,
     ):
-        key = f"sell_{symbol}_{entry}"
+        # FIX: key uses rounded price so 1-pip movements don't bypass cooldown
+        key = f"sell_{symbol}_{self._price_key(entry)}"
         if self._already_alerted(key):
             return
 
@@ -259,16 +321,16 @@ class AlertManager:
             sl, pips_to_sl, reasons,
         )
 
-    # ── Risk Warning ─────────────────────────────────────────────────────────
+    # ── Risk Warning ──────────────────────────────────────────────────────────
     def risk_warning(
         self,
-        level:        str,
-        message:      str,
-        daily_pnl:    float = 0.0,
-        daily_limit:  float = 0.0,
-        pct_used:     float = 0.0,
-        open_trades:  int   = 0,
-        max_trades:   int   = 0,
+        level:       str,
+        message:     str,
+        daily_pnl:   float = 0.0,
+        daily_limit: float = 0.0,
+        pct_used:    float = 0.0,
+        open_trades: int   = 0,
+        max_trades:  int   = 0,
     ):
         """
         Fired by RiskManager when any limit is approached or hit.
@@ -281,14 +343,11 @@ class AlertManager:
           TRADES_FULL — all trade slots full, signal blocked
           LOW_MARGIN  — free margin below 200% safety threshold
         """
-        # Cooldown — LIMIT_HIT and URGENT fire every 3 min,
-        # others fire every 10 min to avoid spam
         cooldown = 3 if level in ("LIMIT_HIT", "URGENT") else 10
         key      = f"risk_{level}"
         if self._already_alerted(key, minutes=cooldown):
             return
 
-        # ── Terminal ──────────────────────────────────────────────────────────
         icons = {
             "WARNING":     "⚠️",
             "URGENT":      "⛔",
@@ -316,13 +375,11 @@ class AlertManager:
         print(f"  {message}")
         print(f"{'═'*52}\n")
 
-        # ── Sound ─────────────────────────────────────────────────────────────
         if level in ("LIMIT_HIT", "URGENT", "TRADES_FULL"):
             self.sound.danger_exit()
         else:
             self.sound.news_warning()
 
-        # ── Telegram ──────────────────────────────────────────────────────────
         self.telegram.risk_warning(
             level=level,
             message=message,

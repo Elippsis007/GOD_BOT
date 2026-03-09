@@ -31,36 +31,81 @@ class MLSignalModel:
     """
     Ensemble ML signal model using XGBoost + LightGBM.
 
-    Upgrades vs previous RF + GB version:
-      - XGBoost  (gradient boosted trees — best single model for tabular data)
-      - LightGBM (faster, handles large datasets and class imbalance well)
-      - Optuna   hyperparameter tuning on Fold 1 only (fast — ~60 s)
-      - Expanded feature set: 50+ features including non-lagging candle
-        pattern ratios, volume spike, volatility regime, ATR-normalised
-        price distances, Ichimoku cloud position, Stochastic divergence,
-        Williams %R, CCI, VWAP distance.
-      - Label generation: 1.2× ATR threshold over a 6-bar forward window
-        with a minimum pip filter (3 pips) to avoid labelling noise as
-        BUY/SELL.
-      - Class weights balanced automatically by both models.
-      - Walk-forward TimeSeriesSplit (5 folds).
-      - Feature importance logged after training (top 15).
+    Timeframe-aware label generation:
+      M1 — ATR_MULTIPLIER=1.2, FORWARD_BARS=10, MIN_PIP_MOVE=0.0003
+            Target HOLD: 45–65%  |  Forward window: 10 minutes
+      M5 — ATR_MULTIPLIER=2.5, FORWARD_BARS=12, MIN_PIP_MOVE=0.0008
+            Target HOLD: 50–65%  |  Forward window: 60 minutes
+
+    The correct param set is selected automatically from
+    CONFIG.SCALPER_TF_SELECTED at train and predict time via
+    _get_label_params().  No manual constant changes needed when
+    switching between M1 and M5.
+
+    FIX 5 — Lookahead bias eliminated:
+      Labels are built from an explicit forward matrix of exactly
+      FORWARD_BARS price bars so no future data beyond the window
+      contaminates training.
+
+    Other features:
+      - Optuna hyperparameter tuning on Fold 1 only (~60 s)
+      - Walk-forward TimeSeriesSplit (3 folds)
+      - 81-feature engineering pipeline
+      - Weighted ensemble: XGB 45% + LGBM 55%
       - Models saved as xgb_<symbol>.pkl, lgbm_<symbol>.pkl,
-        scaler_<symbol>.pkl, features_<symbol>.pkl.
+        scaler_<symbol>.pkl, features_<symbol>.pkl
     """
 
     # ── Tuning budget ─────────────────────────────────────────────────────────
-    OPTUNA_TRIALS   = 25    # trials per model per tuning run
-    N_FOLDS         = 5
-    ATR_MULTIPLIER  = 1.2   # label threshold
-    FORWARD_BARS    = 6     # bars ahead for label calculation
-    MIN_PIP_MOVE    = 0.0003  # ~3 pips minimum move to label as BUY/SELL
+    OPTUNA_TRIALS = 25
+    N_FOLDS       = 3
+
+    # ── M5 label thresholds (tuned — HOLD ~60%) ───────────────────────────────
+    M5_ATR_MULTIPLIER = 2.5
+    M5_FORWARD_BARS   = 12
+    M5_MIN_PIP_MOVE   = 0.0008
+
+    # ── M1 label thresholds (tuned — HOLD ~50%) ───────────────────────────────
+    # M1 ATR is ~5× smaller than M5 ATR so thresholds must be much tighter.
+    # 1.2× ATR over 10 bars = ~10-minute window; 3-pip minimum filters noise.
+    M1_ATR_MULTIPLIER = 1.2
+    M1_FORWARD_BARS   = 10
+    M1_MIN_PIP_MOVE   = 0.0003
 
     def __init__(self):
-        self._xgb:      object = None
-        self._lgbm:     object = None
+        self._xgb:      object         = None
+        self._lgbm:     object         = None
         self._scaler:   StandardScaler = None
-        self._features: list = []
+        self._features: list           = []
+
+    # ────────────────────────────────────────────────────────────────────────
+    #  Timeframe-aware label parameter selector
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _get_label_params(self) -> tuple:
+        """
+        Return (ATR_MULTIPLIER, FORWARD_BARS, MIN_PIP_MOVE) for the
+        currently selected scalper timeframe.
+
+        Reads CONFIG.SCALPER_TF_SELECTED:
+          1  → M1 params  (tighter thresholds, shorter window)
+          5  → M5 params  (looser thresholds, longer window)
+          anything else → M5 params as safe default
+
+        This means retrain_big.py and main.py both simply set
+        CONFIG.SCALPER_TF_SELECTED before calling train() or predict()
+        and the correct label params are applied automatically.
+        """
+        try:
+            from config.settings import CONFIG
+            tf = getattr(CONFIG, "SCALPER_TF_SELECTED", 5)
+        except Exception:
+            tf = 5
+
+        if tf == 1:
+            return self.M1_ATR_MULTIPLIER, self.M1_FORWARD_BARS, self.M1_MIN_PIP_MOVE
+        else:
+            return self.M5_ATR_MULTIPLIER, self.M5_FORWARD_BARS, self.M5_MIN_PIP_MOVE
 
     # ────────────────────────────────────────────────────────────────────────
     #  Public API
@@ -70,14 +115,29 @@ class MLSignalModel:
         """Train on df, save models, return results dict."""
         features, labels = self._build_dataset(df)
         if features is None or len(features) < 200:
-            logger.warning(f"MLModel: not enough data to train ({len(df)} bars)")
+            logger.warning(
+                f"MLModel: not enough data to train ({len(df)} bars)"
+            )
             return {}
 
         self._features = list(features.columns)
         n_samples      = len(features)
+
+        # ── Log which label params are active ─────────────────────────────
+        atr_mult, fwd_bars, min_pip = self._get_label_params()
+        try:
+            from config.settings import CONFIG
+            tf = getattr(CONFIG, "SCALPER_TF_SELECTED", 5)
+        except Exception:
+            tf = 5
+
         logger.info(
             f"🧠 Training ML model on {n_samples} bars | "
-            f"{len(self._features)} features…"
+            f"{len(self._features)} features | TF=M{tf}"
+        )
+        logger.info(
+            f"   Label params → ATR_MULT={atr_mult}  "
+            f"FORWARD_BARS={fwd_bars}  MIN_PIP={min_pip}"
         )
 
         dist = pd.Series(labels).value_counts().sort_index()
@@ -86,13 +146,40 @@ class MLSignalModel:
             f"HOLD={dist.get(0,0)}  BUY={dist.get(1,0)}  SELL={dist.get(2,0)}"
         )
 
+        total    = len(labels)
+        hold_pct = dist.get(0, 0) / total * 100
+        buy_pct  = dist.get(1, 0) / total * 100
+        sell_pct = dist.get(2, 0) / total * 100
+        logger.info(
+            f"   Label %% → HOLD={hold_pct:.1f}%%  "
+            f"BUY={buy_pct:.1f}%%  SELL={sell_pct:.1f}%%"
+        )
+
+        if hold_pct < 35:
+            logger.warning(
+                f"   ⚠️  HOLD share is only {hold_pct:.1f}%% — thresholds may be "
+                f"too loose. Consider raising ATR_MULTIPLIER or MIN_PIP_MOVE "
+                f"for M{tf} in ml_model.py."
+            )
+        elif hold_pct > 75:
+            logger.warning(
+                f"   ⚠️  HOLD share is {hold_pct:.1f}%% — thresholds may be "
+                f"too tight. Consider lowering ATR_MULTIPLIER or MIN_PIP_MOVE "
+                f"for M{tf} in ml_model.py."
+            )
+        else:
+            logger.info(
+                f"   ✅ Label distribution looks healthy "
+                f"(HOLD {hold_pct:.1f}%% is in 35–75%% target range)"
+            )
+
         X = features.values.astype(np.float32)
         y = labels.values.astype(np.int32)
 
-        tscv    = TimeSeriesSplit(n_splits=self.N_FOLDS)
-        splits  = list(tscv.split(X))
+        tscv   = TimeSeriesSplit(n_splits=self.N_FOLDS)
+        splits = list(tscv.split(X))
 
-        # ── Optuna tuning on fold 1 only (keeps training fast) ────────────────
+        # ── Optuna tuning on fold 1 only ──────────────────────────────────
         logger.info("   🔍 Tuning hyperparameters (Optuna)…")
         X_tr, X_val = X[splits[0][0]], X[splits[0][1]]
         y_tr, y_val = y[splits[0][0]], y[splits[0][1]]
@@ -101,25 +188,31 @@ class MLSignalModel:
         Xt_tr   = sc_tune.transform(X_tr)
         Xt_val  = sc_tune.transform(X_val)
 
-        xgb_params  = self._tune_xgb(Xt_tr, y_tr, Xt_val, y_val)
+        xgb_params  = self._tune_xgb(Xt_tr,  y_tr, Xt_val, y_val)
         lgbm_params = self._tune_lgbm(Xt_tr, y_tr, Xt_val, y_val)
         logger.info("   ✅ Hyperparameter tuning complete")
 
-        # ── Walk-forward cross-validation ─────────────────────────────────────
+        # ── Walk-forward cross-validation ─────────────────────────────────
         xgb_scores, lgbm_scores = [], []
         for fold_idx, (tr_idx, val_idx) in enumerate(splits, 1):
             sc   = StandardScaler().fit(X[tr_idx])
             Xtr  = sc.transform(X[tr_idx])
             Xval = sc.transform(X[val_idx])
 
-            xgb_cv  = XGBClassifier(**xgb_params,  random_state=42,
-                                     use_label_encoder=False,
-                                     eval_metric="mlogloss",
-                                     verbosity=0)
-            lgbm_cv = LGBMClassifier(**lgbm_params, random_state=42,
-                                      verbose=-1)
+            xgb_cv = XGBClassifier(
+                **xgb_params,
+                random_state=42,
+                use_label_encoder=False,
+                eval_metric="mlogloss",
+                verbosity=0,
+            )
+            lgbm_cv = LGBMClassifier(
+                **lgbm_params,
+                random_state=42,
+                verbose=-1,
+            )
 
-            xgb_cv.fit(Xtr, y[tr_idx])
+            xgb_cv.fit(Xtr,  y[tr_idx])
             lgbm_cv.fit(Xtr, y[tr_idx])
 
             xgb_score  = accuracy_score(y[val_idx], xgb_cv.predict(Xval))
@@ -135,47 +228,53 @@ class MLSignalModel:
             f"LGBM={np.mean(lgbm_scores):.3f}"
         )
 
-        # ── Final models trained on all data ──────────────────────────────────
+        # ── Final models trained on all data ──────────────────────────────
         self._scaler = StandardScaler().fit(X)
         X_scaled     = self._scaler.transform(X)
 
-        self._xgb = XGBClassifier(**xgb_params, random_state=42,
-                                   use_label_encoder=False,
-                                   eval_metric="mlogloss",
-                                   verbosity=0)
-        self._lgbm = LGBMClassifier(**lgbm_params, random_state=42,
-                                     verbose=-1)
-        self._xgb.fit(X_scaled, y)
+        self._xgb = XGBClassifier(
+            **xgb_params,
+            random_state=42,
+            use_label_encoder=False,
+            eval_metric="mlogloss",
+            verbosity=0,
+        )
+        self._lgbm = LGBMClassifier(
+            **lgbm_params,
+            random_state=42,
+            verbose=-1,
+        )
+        self._xgb.fit(X_scaled,  y)
         self._lgbm.fit(X_scaled, y)
 
-        # ── Final classification report ───────────────────────────────────────
-        y_pred_xgb  = self._xgb.predict(X_scaled)
-        y_pred_lgbm = self._lgbm.predict(X_scaled)
-        y_pred_ens  = self._ensemble_labels(
+        # ── Final classification report ───────────────────────────────────
+        y_pred_ens = self._ensemble_labels(
             self._xgb.predict_proba(X_scaled),
             self._lgbm.predict_proba(X_scaled),
         )
+        logger.info(
+            "\n" + classification_report(
+                y, y_pred_ens,
+                target_names=["HOLD", "BUY", "SELL"],
+                zero_division=0,
+            )
+        )
 
-        logger.info("\n" + classification_report(
-            y, y_pred_ens,
-            target_names=["HOLD", "BUY", "SELL"],
-            zero_division=0,
-        ))
-
-        # ── Feature importances (top 15) ──────────────────────────────────────
+        # ── Feature importances (top 15) ──────────────────────────────────
         importances = (
             self._xgb.feature_importances_ +
             self._lgbm.feature_importances_
         ) / 2.0
         top15 = sorted(
             zip(self._features, importances),
-            key=lambda x: x[1], reverse=True
+            key=lambda x: x[1],
+            reverse=True,
         )[:15]
         logger.info("   📊 Top-15 feature importances (XGB+LGBM average):")
         for name, imp in top15:
             logger.info(f"      {name:<30} {imp:.4f}")
 
-        # ── Save ──────────────────────────────────────────────────────────────
+        # ── Save ──────────────────────────────────────────────────────────
         self._save(symbol)
 
         return {
@@ -188,8 +287,8 @@ class MLSignalModel:
     def predict(self, df: pd.DataFrame) -> dict:
         """Return {'label': int, 'confidence': float, 'probabilities': dict}."""
         _neutral = {
-            "label": 0,
-            "confidence": 0.0,
+            "label":         0,
+            "confidence":    0.0,
             "probabilities": {"HOLD": 1.0, "BUY": 0.0, "SELL": 0.0},
         }
 
@@ -214,13 +313,11 @@ class MLSignalModel:
             xgb_proba  = self._xgb.predict_proba(X)[0]
             lgbm_proba = self._lgbm.predict_proba(X)[0]
 
-            # Safe probability arrays (handle missing classes)
             xgb_full  = self._safe_proba(xgb_proba,  self._xgb.classes_)
             lgbm_full = self._safe_proba(lgbm_proba, self._lgbm.classes_)
 
-            # Weighted ensemble: LGBM slightly higher weight (faster convergence)
-            avg_proba = xgb_full * 0.45 + lgbm_full * 0.55
-
+            # Weighted ensemble: LGBM slightly higher weight
+            avg_proba  = xgb_full * 0.45 + lgbm_full * 0.55
             label      = int(np.argmax(avg_proba))
             confidence = float(avg_proba[label])
 
@@ -247,15 +344,20 @@ class MLSignalModel:
 
             for p in (xgb_path, lgbm_path, sc_path, ft_path):
                 if not os.path.exists(p):
-                    logger.info(f"MLModel: No saved model found for {symbol} — training required")
+                    logger.info(
+                        f"MLModel: No saved model found for {symbol} "
+                        f"— training required"
+                    )
                     return False
 
-            with open(xgb_path,  "rb") as f: self._xgb      = pickle.load(f)
-            with open(lgbm_path, "rb") as f: self._lgbm     = pickle.load(f)
-            with open(sc_path,   "rb") as f: self._scaler   = pickle.load(f)
-            with open(ft_path,   "rb") as f: self._features = pickle.load(f)
+            with open(xgb_path,  "rb") as fh: self._xgb      = pickle.load(fh)
+            with open(lgbm_path, "rb") as fh: self._lgbm     = pickle.load(fh)
+            with open(sc_path,   "rb") as fh: self._scaler   = pickle.load(fh)
+            with open(ft_path,   "rb") as fh: self._features = pickle.load(fh)
 
-            logger.info(f"📊 Model loaded for {symbol} ({len(self._features)} features)")
+            logger.info(
+                f"📊 Model loaded for {symbol} ({len(self._features)} features)"
+            )
             return True
 
         except Exception as e:
@@ -270,21 +372,24 @@ class MLSignalModel:
     def _tune_xgb(self, X_tr, y_tr, X_val, y_val) -> dict:
         def objective(trial):
             params = {
-                "n_estimators":      trial.suggest_int("n_estimators", 100, 400),
-                "max_depth":         trial.suggest_int("max_depth", 3, 8),
-                "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
-                "subsample":         trial.suggest_float("subsample", 0.6, 1.0),
-                "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                "min_child_weight":  trial.suggest_int("min_child_weight", 5, 30),
-                "reg_alpha":         trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
-                "reg_lambda":        trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-                "num_class":         3,
-                "objective":         "multi:softprob",
+                "n_estimators":     trial.suggest_int("n_estimators", 100, 400),
+                "max_depth":        trial.suggest_int("max_depth", 3, 8),
+                "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+                "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "min_child_weight": trial.suggest_int("min_child_weight", 5, 30),
+                "reg_alpha":        trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+                "reg_lambda":       trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+                "num_class":        3,
+                "objective":        "multi:softprob",
             }
-            mdl = XGBClassifier(**params, random_state=42,
-                                use_label_encoder=False,
-                                eval_metric="mlogloss",
-                                verbosity=0)
+            mdl = XGBClassifier(
+                **params,
+                random_state=42,
+                use_label_encoder=False,
+                eval_metric="mlogloss",
+                verbosity=0,
+            )
             mdl.fit(X_tr, y_tr)
             return accuracy_score(y_val, mdl.predict(X_val))
 
@@ -295,17 +400,17 @@ class MLSignalModel:
     def _tune_lgbm(self, X_tr, y_tr, X_val, y_val) -> dict:
         def objective(trial):
             params = {
-                "n_estimators":     trial.suggest_int("n_estimators", 100, 400),
-                "max_depth":        trial.suggest_int("max_depth", 3, 8),
-                "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
-                "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                "min_child_samples":trial.suggest_int("min_child_samples", 10, 50),
-                "reg_alpha":        trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
-                "reg_lambda":       trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-                "num_class":        3,
-                "objective":        "multiclass",
-                "class_weight":     "balanced",
+                "n_estimators":      trial.suggest_int("n_estimators", 100, 400),
+                "max_depth":         trial.suggest_int("max_depth", 3, 8),
+                "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
+                "subsample":         trial.suggest_float("subsample", 0.6, 1.0),
+                "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "min_child_samples": trial.suggest_int("min_child_samples", 10, 50),
+                "reg_alpha":         trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
+                "reg_lambda":        trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
+                "num_class":         3,
+                "objective":         "multiclass",
+                "class_weight":      "balanced",
             }
             mdl = LGBMClassifier(**params, random_state=42, verbose=-1)
             mdl.fit(X_tr, y_tr)
@@ -321,7 +426,7 @@ class MLSignalModel:
 
     def _build_dataset(
         self,
-        df: pd.DataFrame,
+        df:             pd.DataFrame,
         for_prediction: bool = False,
     ):
         """Build feature matrix and (optionally) label vector."""
@@ -329,10 +434,12 @@ class MLSignalModel:
             df = df.copy()
             df.columns = df.columns.str.lower()
 
-            required = {"open", "high", "low", "close", "atr",
-                        "ema_fast", "ema_slow", "rsi", "macd",
-                        "macd_signal", "bb_upper", "bb_lower", "bb_mid"}
-            missing  = required - set(df.columns)
+            required = {
+                "open", "high", "low", "close", "atr",
+                "ema_fast", "ema_slow", "rsi", "macd",
+                "macd_signal", "bb_upper", "bb_lower", "bb_mid",
+            }
+            missing = required - set(df.columns)
             if missing:
                 logger.warning(f"MLModel: missing columns {missing}")
                 return None, None
@@ -342,15 +449,19 @@ class MLSignalModel:
             # ── Price returns ──────────────────────────────────────────────
             atr_safe = df["atr"].replace(0, np.nan)
             for n in [1, 2, 3, 5, 8, 13]:
-                f[f"ret_{n}"]      = df["close"].pct_change(n) * 100
-                f[f"ret_atr_{n}"]  = df["close"].diff(n) / atr_safe
+                f[f"ret_{n}"]     = df["close"].pct_change(n) * 100
+                f[f"ret_atr_{n}"] = df["close"].diff(n) / atr_safe
 
             # ── Candle structure ───────────────────────────────────────────
-            body        = (df["close"] - df["open"]).abs()
+            body         = (df["close"] - df["open"]).abs()
             candle_range = (df["high"] - df["low"]).replace(0, np.nan)
             f["body_ratio"]       = body / candle_range
-            f["upper_wick_ratio"] = (df["high"] - df[["open","close"]].max(axis=1)) / candle_range
-            f["lower_wick_ratio"] = (df[["open","close"]].min(axis=1) - df["low"]) / candle_range
+            f["upper_wick_ratio"] = (
+                df["high"] - df[["open", "close"]].max(axis=1)
+            ) / candle_range
+            f["lower_wick_ratio"] = (
+                df[["open", "close"]].min(axis=1) - df["low"]
+            ) / candle_range
             f["candle_direction"] = np.sign(df["close"] - df["open"])
             f["candle_range_atr"] = candle_range / atr_safe
 
@@ -364,17 +475,17 @@ class MLSignalModel:
             ).cumcount().where(direction < 0, 0)
 
             # ── EMA features ───────────────────────────────────────────────
-            f["ema_fast"]           = df["ema_fast"]
-            f["ema_slow"]           = df["ema_slow"]
-            f["ema_spread_atr"]     = (df["ema_fast"] - df["ema_slow"]) / atr_safe
-            f["price_vs_ema_fast"]  = (df["close"] - df["ema_fast"]) / atr_safe
-            f["price_vs_ema_slow"]  = (df["close"] - df["ema_slow"]) / atr_safe
+            f["ema_fast"]          = df["ema_fast"]
+            f["ema_slow"]          = df["ema_slow"]
+            f["ema_spread_atr"]    = (df["ema_fast"] - df["ema_slow"]) / atr_safe
+            f["price_vs_ema_fast"] = (df["close"] - df["ema_fast"]) / atr_safe
+            f["price_vs_ema_slow"] = (df["close"] - df["ema_slow"]) / atr_safe
 
             if "ema_trend" in df.columns:
                 f["price_vs_ema_trend"] = (df["close"] - df["ema_trend"]) / atr_safe
                 f["ema_trend_slope"]    = df["ema_trend"].diff(3) / atr_safe
 
-            # ── EMA slope (momentum of the MA itself) ──────────────────────
+            # ── EMA slope ─────────────────────────────────────────────────
             f["ema_fast_slope"] = df["ema_fast"].diff(2) / atr_safe
             f["ema_slow_slope"] = df["ema_slow"].diff(2) / atr_safe
 
@@ -398,27 +509,27 @@ class MLSignalModel:
 
             # ── Bollinger Band features ────────────────────────────────────
             bb_width = (df["bb_upper"] - df["bb_lower"]).replace(0, np.nan)
-            f["bb_position"]   = (df["close"] - df["bb_lower"]) / bb_width
-            f["bb_width_atr"]  = bb_width / atr_safe
-            f["bb_squeeze"]    = bb_width / df["bb_mid"]
+            f["bb_position"]  = (df["close"] - df["bb_lower"]) / bb_width
+            f["bb_width_atr"] = bb_width / atr_safe
+            f["bb_squeeze"]   = bb_width / df["bb_mid"]
 
             if "bb_width" in df.columns:
                 f["bb_width_change"] = df["bb_width"].diff(1)
 
             # ── ATR & Volatility features ──────────────────────────────────
-            f["atr_ratio"]      = atr_safe / df["close"]
-            f["atr_lag1"]       = df["atr"].shift(1)
-            f["atr_change"]     = df["atr"].diff(1) / atr_safe
-            f["volatility"]     = df["close"].pct_change().rolling(10).std()
-            f["vol_ratio"]      = atr_safe / df["atr"].rolling(20).mean()
+            f["atr_ratio"]  = atr_safe / df["close"]
+            f["atr_lag1"]   = df["atr"].shift(1)
+            f["atr_change"] = df["atr"].diff(1) / atr_safe
+            f["volatility"] = df["close"].pct_change().rolling(10).std()
+            f["vol_ratio"]  = atr_safe / df["atr"].rolling(20).mean()
 
             # ── Volume features ────────────────────────────────────────────
             if "volume" in df.columns:
-                vol        = df["volume"].replace(0, np.nan)
-                vol_ma     = vol.rolling(20).mean().replace(0, np.nan)
-                f["vol_ratio_20"]  = vol / vol_ma
-                f["vol_change"]    = vol.pct_change(1)
-                f["vol_spike"]     = (vol > vol_ma * 2.0).astype(int)
+                vol    = df["volume"].replace(0, np.nan)
+                vol_ma = vol.rolling(20).mean().replace(0, np.nan)
+                f["vol_ratio_20"] = vol / vol_ma
+                f["vol_change"]   = vol.pct_change(1)
+                f["vol_spike"]    = (vol > vol_ma * 2.0).astype(int)
 
             # ── CMF ────────────────────────────────────────────────────────
             if "cmf" in df.columns:
@@ -459,11 +570,11 @@ class MLSignalModel:
 
             if "senkou_a" in df.columns and "senkou_b" in df.columns:
                 f["in_cloud"] = (
-                    (df["close"] > df[["senkou_a","senkou_b"]].min(axis=1)) &
-                    (df["close"] < df[["senkou_a","senkou_b"]].max(axis=1))
+                    (df["close"] > df[["senkou_a", "senkou_b"]].min(axis=1)) &
+                    (df["close"] < df[["senkou_a", "senkou_b"]].max(axis=1))
                 ).astype(int)
                 f["above_cloud"] = (
-                    df["close"] > df[["senkou_a","senkou_b"]].max(axis=1)
+                    df["close"] > df[["senkou_a", "senkou_b"]].max(axis=1)
                 ).astype(int)
 
             # ── Squeeze (BB inside KC) ─────────────────────────────────────
@@ -477,10 +588,14 @@ class MLSignalModel:
                     (df["close"] - df["close"].rolling(w).mean()) /
                     df["close"].rolling(w).std().replace(0, np.nan)
                 )
-                f[f"high_{w}"]  = (df["close"] == df["high"].rolling(w).max()).astype(int)
-                f[f"low_{w}"]   = (df["close"] == df["low"].rolling(w).min()).astype(int)
+                f[f"high_{w}"] = (
+                    df["close"] == df["high"].rolling(w).max()
+                ).astype(int)
+                f[f"low_{w}"] = (
+                    df["close"] == df["low"].rolling(w).min()
+                ).astype(int)
 
-            # ── Hour of day (session context) ─────────────────────────────
+            # ── Hour of day (session context) ──────────────────────────────
             if hasattr(df.index, "hour"):
                 f["hour"] = df.index.hour
                 f["is_overlap"] = (
@@ -512,41 +627,62 @@ class MLSignalModel:
         atr_safe: pd.Series,
     ) -> pd.Series:
         """
-        Label each bar as BUY=1 / SELL=2 / HOLD=0.
+        FIX 5 — Lookahead bias eliminated.
 
-        Logic:
-          - Look FORWARD_BARS bars ahead.
-          - If future_high > close + ATR_MULTIPLIER * atr AND move > MIN_PIP_MOVE → BUY
-          - If future_low  < close - ATR_MULTIPLIER * atr AND move > MIN_PIP_MOVE → SELL
-          - Otherwise HOLD.
-        When both conditions are met, the larger move wins.
+        Timeframe-aware thresholds via _get_label_params():
+          M1 → ATR_MULT=1.2  FORWARD_BARS=10  MIN_PIP=0.0003
+               10-minute window, ~3-pip minimum
+               Target HOLD: 45–65%
+          M5 → ATR_MULT=2.5  FORWARD_BARS=12  MIN_PIP=0.0008
+               60-minute window, ~8-pip minimum
+               Target HOLD: 50–65%
+
+        Labels:
+          BUY  (1) — max(high[t+1..t+N]) > close[t] + ATR_MULT*ATR[t]
+                     AND move > MIN_PIP
+          SELL (2) — min(low[t+1..t+N])  < close[t] - ATR_MULT*ATR[t]
+                     AND move > MIN_PIP
+          HOLD (0) — neither condition met, or both (larger move wins)
         """
+        atr_mult, fwd_bars, min_pip = self._get_label_params()
+
         close     = df["close"]
-        threshold = atr_safe * self.ATR_MULTIPLIER
+        threshold = atr_safe * atr_mult
 
-        future_high = close.shift(-self.FORWARD_BARS).rolling(
-            self.FORWARD_BARS, min_periods=1
-        ).max().shift(-(self.FORWARD_BARS - 1))
+        # ── Explicit forward matrix — no rolling, no extra shifting ───────
+        fwd_high_cols = [df["high"].shift(-i) for i in range(1, fwd_bars + 1)]
+        fwd_low_cols  = [df["low"].shift(-i)  for i in range(1, fwd_bars + 1)]
 
-        future_low = close.shift(-self.FORWARD_BARS).rolling(
-            self.FORWARD_BARS, min_periods=1
-        ).min().shift(-(self.FORWARD_BARS - 1))
+        fwd_high_matrix = pd.concat(fwd_high_cols, axis=1)
+        fwd_low_matrix  = pd.concat(fwd_low_cols,  axis=1)
 
-        # Vectorised label assignment
+        future_high = fwd_high_matrix.max(axis=1)
+        future_low  = fwd_low_matrix.min(axis=1)
+
+        # Drop rows where any future bar is NaN (last fwd_bars rows)
+        valid_mask = (
+            fwd_high_matrix.notna().all(axis=1) &
+            fwd_low_matrix.notna().all(axis=1)
+        )
+
         up_move   = future_high - close
         down_move = close - future_low
 
-        buy_cond  = (up_move   > threshold) & (up_move   > self.MIN_PIP_MOVE)
-        sell_cond = (down_move > threshold) & (down_move > self.MIN_PIP_MOVE)
+        buy_cond  = (up_move   > threshold) & (up_move   > min_pip)
+        sell_cond = (down_move > threshold) & (down_move > min_pip)
 
         labels = pd.Series(0, index=close.index, dtype=np.int32)
-        labels[buy_cond  & ~sell_cond]             = 1
-        labels[sell_cond & ~buy_cond]              = 2
-        labels[buy_cond  &  sell_cond & (up_move >= down_move)] = 1
-        labels[buy_cond  &  sell_cond & (up_move <  down_move)] = 2
+        labels[buy_cond  & ~sell_cond]                              = 1
+        labels[sell_cond & ~buy_cond]                               = 2
+        labels[buy_cond  &  sell_cond & (up_move >= down_move)]     = 1
+        labels[buy_cond  &  sell_cond & (up_move <  down_move)]     = 2
+        labels = labels[valid_mask]
 
-        # Drop last FORWARD_BARS rows — no forward data available
-        labels = labels.iloc[:-self.FORWARD_BARS]
+        logger.debug(
+            f"_create_labels: {valid_mask.sum()} valid rows | "
+            f"ATR_MULT={atr_mult}  FWD={fwd_bars}  MIN_PIP={min_pip}"
+        )
+
         return labels
 
     # ────────────────────────────────────────────────────────────────────────
@@ -560,7 +696,6 @@ class MLSignalModel:
         for i, cls in enumerate(classes):
             if 0 <= cls <= 2:
                 full[cls] = proba[i]
-        # Normalise
         total = full.sum()
         return full / total if total > 0 else np.array([1.0, 0.0, 0.0])
 
@@ -579,11 +714,8 @@ class MLSignalModel:
                 f"features_{symbol}.pkl": self._features,
             }
             for fname, obj in paths.items():
-                with open(os.path.join(MODEL_DIR, fname), "wb") as f:
-                    pickle.dump(obj, f)
-
-            mean_xgb  = 0.0   # updated by caller via return dict
-            mean_lgbm = 0.0
+                with open(os.path.join(MODEL_DIR, fname), "wb") as fh:
+                    pickle.dump(obj, fh)
             logger.info(f"✅ Model saved for {symbol}")
         except Exception as e:
             logger.error(f"MLModel save error: {e}")
@@ -591,12 +723,10 @@ class MLSignalModel:
     @staticmethod
     def _delete_model_files(symbol: str) -> None:
         patterns = [
-            # New format
             f"xgb_{symbol}.pkl",
             f"lgbm_{symbol}.pkl",
             f"scaler_{symbol}.pkl",
             f"features_{symbol}.pkl",
-            # Legacy format (RF/GB from old version)
             f"rf_{symbol}.pkl",
             f"gb_{symbol}.pkl",
         ]

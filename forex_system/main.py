@@ -17,14 +17,14 @@ import MetaTrader5 as mt5
 from datetime import datetime
 from typing import Optional
 
-from core.mt5_connector       import MT5Connector, MT5_TIMEFRAME_MAP
-from core.indicators          import IndicatorEngine
-from signals.signal_engine    import SignalEngine
-from signals.ml_model         import MLSignalModel
-from risk.risk_manager        import RiskManager
-from execution.order_executor  import OrderExecutor
-from monitoring.logger        import get_logger
-from monitoring.dashboard     import Dashboard
+from core.mt5_connector          import MT5Connector, MT5_TIMEFRAME_MAP
+from core.indicators             import IndicatorEngine
+from signals.signal_engine       import SignalEngine
+from signals.ml_model            import MLSignalModel
+from risk.risk_manager           import RiskManager
+from execution.order_executor    import OrderExecutor
+from monitoring.logger           import get_logger
+from monitoring.dashboard        import Dashboard
 from notifications.alert_manager import AlertManager
 from research.calendar_scanner   import CalendarScanner
 from research.sentiment_analyzer import SentimentAnalyzer
@@ -55,7 +55,7 @@ ML_LABEL_MAP = {0: "HOLD", 1: "BUY", 2: "SELL"}
 #  Profile persistence
 # ────────────────────────────────────────────────────────────────────────────
 class ProfileManager:
-    DEFAULT = {"style": "scalper", "mode": "1", "name": TRADER_NAME}
+    DEFAULT = {"style": "scalper", "mode": "1", "name": TRADER_NAME, "scalper_tf": 5}
 
     def load(self) -> dict:
         try:
@@ -80,8 +80,9 @@ class ProfileManager:
 #  Interactive startup menu
 # ────────────────────────────────────────────────────────────────────────────
 class StartupMenu:
-    STYLES = {"1": "scalper", "2": "daytrader"}
-    MODES  = {"1": "Signal Only", "2": "Semi Automated", "3": "Fully Automated"}
+    STYLES    = {"1": "scalper", "2": "daytrader"}
+    MODES     = {"1": "Signal Only", "2": "Semi Automated", "3": "Fully Automated"}
+    SCALPER_TF = {"1": 1, "2": 5}   # menu key → MT5 timeframe integer
 
     def __init__(self):
         self.profile_mgr = ProfileManager()
@@ -95,7 +96,9 @@ class StartupMenu:
             self._print_saved_profile(profile)
             if self._ask("Use saved profile? (Y/N): ", ["y", "n"]) == "y":
                 logger.info(
-                    f"✅ Loaded profile: {profile['style'].title()} | Mode {profile['mode']}"
+                    f"✅ Loaded profile: {profile['style'].title()} | "
+                    f"Mode {profile['mode']} | "
+                    f"TF M{profile.get('scalper_tf', 5)}"
                 )
                 return profile
 
@@ -111,24 +114,51 @@ class StartupMenu:
         print("=" * 60 + "\n")
 
     def _print_saved_profile(self, profile: dict) -> None:
+        style = profile.get("style", "?").title()
+        tf    = profile.get("scalper_tf", 5)
+        tf_str = f"M{tf}" if style.lower() == "scalper" else "—"
         print("  📂  Saved Profile Found")
-        print(f"      Style : {profile.get('style', '?').title()}")
+        print(f"      Style : {style}  ({tf_str})")
         print(f"      Mode  : {profile.get('mode', '?')} — "
               f"{self.MODES.get(profile.get('mode', '1'), '?')}")
         print(f"      Name  : {profile.get('name', '?')}\n")
 
     def _select_settings(self, profile: dict) -> dict:
+        # ── Trading style ─────────────────────────────────────────────────────
         print("  Select Trading Style:")
         print("    1 = Scalper    (short-term, tight spreads)")
         print("    2 = Day Trader (swing positions)\n")
-        style_key = self._ask("Style (1 or 2): ", ["1", "2"])
+        style_key      = self._ask("Style (1 or 2): ", ["1", "2"])
         profile["style"] = self.STYLES[style_key]
 
-        print("\n  Select Operation Mode:")
+        # ── Scalper timeframe ─────────────────────────────────────────────────
+        if profile["style"] == "scalper":
+            print("\n  Select Scalper Timeframe:")
+            print("    1 = M1  (1-minute — ultra-fast scalping)")
+            print("         RSI 7 | EMA 5/13/34 | MACD 5/13/4 | ATR 7")
+            print("         TP ~6 pips | SL ~3 pips | Max spread 0.8 pips")
+            print("         Scan every 10 seconds\n")
+            print("    2 = M5  (5-minute — standard scalping)  [recommended]")
+            print("         RSI 9 | EMA 8/21/50 | MACD 8/21/5 | ATR 10")
+            print("         TP ~12 pips | SL ~6 pips | Max spread 1.2 pips")
+            print("         Scan every 20 seconds\n")
+            tf_key               = self._ask("Timeframe (1 or 2): ", ["1", "2"])
+            profile["scalper_tf"] = self.SCALPER_TF[tf_key]
+            print(
+                f"\n  ✅ Scalper M{profile['scalper_tf']} profile selected — "
+                f"all thresholds set automatically.\n"
+            )
+        else:
+            # Day trader — no TF choice needed; fixed M15 primary / H1 confirm
+            profile["scalper_tf"] = 5   # not used for day trader but keep key consistent
+
+        # ── Operation mode ────────────────────────────────────────────────────
+        print("  Select Operation Mode:")
         for k, v in self.MODES.items():
             print(f"    {k} = {v}")
         profile["mode"] = self._ask("\nMode (1 / 2 / 3): ", ["1", "2", "3"])
 
+        # ── Trader name ───────────────────────────────────────────────────────
         name = input(f"  Trader name [{profile.get('name', TRADER_NAME)}]: ").strip()
         if name:
             profile["name"] = name
@@ -159,9 +189,26 @@ class ForexSystem:
         self._paused  = False
         self._last_candle_time: dict = {}
 
+        # ── FIX 2: Track open bot positions so we can detect broker-closed
+        # trades (TP/SL hits) on the next monitor cycle.
+        self._open_positions: dict = {}
+
+        # ── Apply selected scalper TF to CONFIG before any component loads ────
+        # This ensures CONFIG.get_scalper_profile() returns the correct
+        # M1 or M5 block for SignalEngine, IndicatorEngine, retrain, etc.
+        scalper_tf = int(profile.get("scalper_tf", 5))
+        CONFIG.SCALPER_TF_SELECTED = scalper_tf
+        logger.info(
+            f"⚙️  CONFIG.SCALPER_TF_SELECTED set to M{scalper_tf} "
+            f"(style={self.style})"
+        )
+
         self.connector   = MT5Connector()
         self.indicators  = IndicatorEngine()
-        self.signal_eng  = SignalEngine()
+
+        # Build SignalEngine with the trading style so it loads the right profile
+        self.signal_eng  = SignalEngine(config=CONFIG, trading_style=self.style)
+
         self.ml_model    = MLSignalModel()
         self.risk_mgr    = RiskManager()
         self.executor    = OrderExecutor()
@@ -175,7 +222,23 @@ class ForexSystem:
         self.risk_mgr.set_alerts(self.alerts)
         self._start_keyboard_listener()
 
-    # ── startup ──────────────────────────────────────────────────────────────
+    # ── Active scalper profile helper ─────────────────────────────────────────
+    def _scalper_profile(self) -> dict:
+        """Return the active scalper profile dict (M1 or M5)."""
+        try:
+            return CONFIG.get_scalper_profile()
+        except Exception:
+            return {
+                "tf_primary":   SCALPER_TF_PRIMARY,
+                "tf_confirm":   SCALPER_TF_CONFIRM,
+                "scan_secs":    SCALPER_SCAN_SECS,
+                "max_spread":   SCALPER_MAX_SPREAD,
+                "signal_score": SCALPER_SIGNAL_SCORE,
+                "sl_pips":      SCALPER_SL_PIPS,
+                "tp_pips":      SCALPER_TP_PIPS,
+            }
+
+    # ── startup ───────────────────────────────────────────────────────────────
     def start(self) -> None:
         if not self.connector.connect():
             raise RuntimeError("Cannot connect to MT5 — is the terminal open?")
@@ -202,9 +265,12 @@ class ForexSystem:
         self._run_loop()
 
     def _print_launch_summary(self, account: dict) -> None:
+        tf_label = ""
+        if self.style == "scalper":
+            tf_label = f"  M{CONFIG.SCALPER_TF_SELECTED}"
         print("\n" + "─" * 60)
         print(f"  👤  Trader  : {self.profile.get('name', TRADER_NAME)}")
-        print(f"  💼  Style   : {self.style.title()}")
+        print(f"  💼  Style   : {self.style.title()}{tf_label}")
         print(f"  🎮  Mode    : {self.mode} — {self.MODE_NAMES[self.mode]}")
         print(f"  💰  Balance : {account.get('balance', 0):,.2f} {account.get('currency', '')}")
         print(f"  📈  Equity  : {account.get('equity',  0):,.2f} {account.get('currency', '')}")
@@ -213,28 +279,46 @@ class ForexSystem:
         print("─" * 60 + "\n")
 
     def _load_ml_models(self) -> None:
-        tf = SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY
+        # Resolve correct training timeframe from active profile
+        if self.style == "scalper":
+            tf = self._scalper_profile()["tf_primary"]
+        else:
+            tf = DAYTRADER_TF_PRIMARY
+
         for symbol in CONFIG.WATCHLIST:
-            logger.info(f"🤖 Loading / training ML model for {symbol}…")
+            logger.info(f"🤖 Loading / training ML model for {symbol} on M{tf}…")
             loaded = self.ml_model.load(symbol)
             if not loaded:
-                logger.info(f"   No saved model found for {symbol} — training from scratch…")
+                logger.info(
+                    f"   No saved model for {symbol} — training from scratch "
+                    f"on M{tf}…"
+                )
                 df_raw = self.connector.get_ohlcv(symbol, tf, bars=5000)
                 if df_raw is not None and not df_raw.empty:
                     df = self.indicators.compute_all(df_raw)
                     if df is not None and not df.empty:
                         self.ml_model.train(df, symbol)
-                        logger.info(f"   ✅ ML model trained and saved for {symbol}.")
+                        logger.info(f"   ✅ ML model trained for {symbol} (M{tf}).")
                     else:
-                        logger.warning(f"   ⚠️  Indicators returned empty data for {symbol}.")
+                        logger.warning(
+                            f"   ⚠️  Indicators returned empty data for {symbol}."
+                        )
                 else:
-                    logger.warning(f"   ⚠️  No OHLCV data for {symbol} — skipping.")
+                    logger.warning(
+                        f"   ⚠️  No OHLCV data for {symbol} on M{tf} — skipping."
+                    )
             else:
                 logger.info(f"   ✅ ML model loaded from disk for {symbol}.")
 
     # ── main loop ─────────────────────────────────────────────────────────────
     def _run_loop(self) -> None:
-        scan_secs = SCALPER_SCAN_SECS if self.style == "scalper" else DAYTRADER_SCAN_SECS
+        # Resolve scan interval and timeframes from the active profile
+        if self.style == "scalper":
+            p         = self._scalper_profile()
+            scan_secs = p["scan_secs"]
+        else:
+            scan_secs = DAYTRADER_SCAN_SECS
+
         self.dashboard.set_scan_secs(scan_secs)
 
         schedule.every(scan_secs).seconds.do(self._scan_markets)
@@ -243,9 +327,15 @@ class ForexSystem:
         schedule.every().day.at("23:45").do(self._close_all_day_trades)
         schedule.every().day.at("23:55").do(self._daily_summary)
 
+        tf_label = (
+            f"M{self._scalper_profile()['tf_primary']}"
+            if self.style == "scalper"
+            else f"M{DAYTRADER_TF_PRIMARY}"
+        )
         logger.info(
-            f"⚙️ Scan: {scan_secs}s | Mode: {self.MODE_NAMES[self.mode]} | "
-            f"Style: {self.style.title()} | Watchlist: {', '.join(CONFIG.WATCHLIST)}"
+            f"⚙️  Scan: {scan_secs}s | Mode: {self.MODE_NAMES[self.mode]} | "
+            f"Style: {self.style.title()} | TF: {tf_label} | "
+            f"Watchlist: {', '.join(CONFIG.WATCHLIST)}"
         )
 
         while self._running:
@@ -269,29 +359,76 @@ class ForexSystem:
             return False
         return True
 
-    def _is_overlap_session(self) -> bool:
-        hour = datetime.now(TIMEZONE).hour
-        return OVERLAP_START <= hour < OVERLAP_END
+    def _is_preferred_session(self) -> bool:
+        """
+        FIX 3: Returns True only when the current CET hour falls inside one
+        of the sessions listed in CONFIG.TRADE_SESSIONS.
+        """
+        hour     = datetime.now(TIMEZONE).hour
+        sessions = CONFIG.TRADE_SESSIONS
+
+        session_ranges = {
+            "london":  (LONDON_OPEN_CET, 17),
+            "newyork": (14, NY_CLOSE_CET),
+            "overlap": (OVERLAP_START, OVERLAP_END),
+        }
+
+        for session in sessions:
+            start, end = session_ranges.get(session, (0, 24))
+            if start <= hour < end:
+                return True
+
+        logger.debug(
+            f"Hour {hour:02d}:xx CET — outside configured sessions "
+            f"{sessions} — skipping scan."
+        )
+        return False
 
     # ── scanning ──────────────────────────────────────────────────────────────
     def _scan_markets(self) -> None:
+        """
+        FIX 1: Dashboard scan status updated around the full scan cycle.
+        FIX 3: Session filter enforced.
+        """
         if not self._is_trading_session():
+            self.dashboard.update_scan_status("Waiting")
             return
-        for symbol in CONFIG.WATCHLIST:
-            self._process_symbol(symbol)
+
+        if not self._is_preferred_session():
+            self.dashboard.update_scan_status("Waiting")
+            return
+
+        self.dashboard.update_scan_status("Running")
+        try:
+            for symbol in CONFIG.WATCHLIST:
+                self._process_symbol(symbol)
+            self.dashboard.update_scan_status("Completed")
+        except Exception as e:
+            logger.error(f"Scan error: {e}")
+            logger.debug(traceback.format_exc())
+            self.dashboard.update_scan_status("Error")
 
     # ── per-symbol processing ─────────────────────────────────────────────────
     def _process_symbol(self, symbol: str) -> None:
-        tf = SCALPER_TF_PRIMARY if self.style == "scalper" else DAYTRADER_TF_PRIMARY
+        # Resolve timeframe and max spread from the active profile
+        if self.style == "scalper":
+            p      = self._scalper_profile()
+            tf     = p["tf_primary"]
+            max_sp = p["max_spread"]
+        else:
+            tf     = DAYTRADER_TF_PRIMARY
+            max_sp = DAYTRADER_MAX_SPREAD
 
         # ── Spread gate ───────────────────────────────────────────────────────
         tick     = mt5.symbol_info_tick(symbol)
         sym_info = mt5.symbol_info(symbol)
         if tick and sym_info:
             spread = (tick.ask - tick.bid) / sym_info.point / 10
-            max_sp = SCALPER_MAX_SPREAD if self.style == "scalper" else DAYTRADER_MAX_SPREAD
             if spread > max_sp:
-                logger.debug(f"[{symbol}] Spread too wide: {spread:.1f} pips (max {max_sp})")
+                logger.debug(
+                    f"[{symbol}] Spread too wide: {spread:.1f} pips "
+                    f"(max {max_sp})"
+                )
                 return
 
         # ── Gate 1 — Calendar ─────────────────────────────────────────────────
@@ -309,12 +446,15 @@ class ForexSystem:
         if rates is not None and len(rates) > 0:
             candle_time = rates[0]["time"]
             if self._last_candle_time.get(symbol) == candle_time:
-                logger.debug(f"[{symbol}] Same candle — skipping heavy computation.")
+                logger.debug(
+                    f"[{symbol}] Same candle — skipping heavy computation."
+                )
                 return
             self._last_candle_time[symbol] = candle_time
             logger.debug(
                 f"[{symbol}] New candle @ "
-                f"{datetime.utcfromtimestamp(candle_time).strftime('%H:%M:%S')} UTC"
+                f"{datetime.utcfromtimestamp(candle_time).strftime('%H:%M:%S')} UTC "
+                f"| TF=M{tf}"
             )
 
         # ── Gate 2 — Technical ────────────────────────────────────────────────
@@ -324,7 +464,9 @@ class ForexSystem:
             return
         df = self.indicators.compute_all(df_raw)
         if df is None or df.empty:
-            logger.debug(f"[{symbol}] ⛔ Gate 2 BLOCKED — indicators returned empty DataFrame")
+            logger.debug(
+                f"[{symbol}] ⛔ Gate 2 BLOCKED — indicators returned empty DataFrame"
+            )
             return
 
         signal = self.signal_eng.evaluate(df, symbol)
@@ -334,11 +476,12 @@ class ForexSystem:
 
         logger.debug(
             f"[{symbol}] ✅ Gate 2 PASSED — {signal.signal.value} | "
-            f"Strength={signal.strength:.2f} | Conf={signal.confidence:.0%}"
+            f"Strength={signal.strength:.2f} | Conf={signal.confidence:.0%} | "
+            f"TF=M{tf}"
         )
 
-        # ── Gate 3 — ML (direction check temporarily bypassed) ───────────────
-        ml = self.ml_model.predict(df)
+        # ── Gate 3 — ML ───────────────────────────────────────────────────────
+        ml           = self.ml_model.predict(df)
         ml_direction = ML_LABEL_MAP.get(ml["label"], str(ml["label"]))
 
         logger.debug(
@@ -351,8 +494,7 @@ class ForexSystem:
             f"SELL={ml['probabilities']['SELL']:.0%}"
         )
 
-        # NOTE: ML direction veto temporarily disabled — retrain scheduled
-        # Only block if ML confidence is below minimum threshold
+        # ── FIX 4: ML direction veto ──────────────────────────────────────────
         if ml["confidence"] < CONFIG.ML_MIN_CONFIDENCE:
             logger.debug(
                 f"[{symbol}] ⛔ Gate 3 BLOCKED — ML confidence too low: "
@@ -360,8 +502,17 @@ class ForexSystem:
             )
             return
 
+        if ml_direction != "HOLD" and ml_direction != signal.signal.value:
+            logger.debug(
+                f"[{symbol}] ⛔ Gate 3 BLOCKED — ML direction conflict: "
+                f"signal={signal.signal.value} but ML predicts {ml_direction} "
+                f"@ {ml['confidence']:.0%} confidence"
+            )
+            return
+
         logger.debug(
-            f"[{symbol}] ✅ Gate 3 PASSED — ML={ml_direction} Conf={ml['confidence']:.0%}"
+            f"[{symbol}] ✅ Gate 3 PASSED — ML={ml_direction} "
+            f"Conf={ml['confidence']:.0%}"
         )
 
         # ── Gate 4 — Sentiment (Day Trader only) ─────────────────────────────
@@ -379,7 +530,9 @@ class ForexSystem:
             if signal.signal.value == "SELL" and sent["score"] > 0.1:
                 logger.debug(f"[{symbol}] ⛔ Gate 4 BLOCKED — Sentiment bullish")
                 return
-            logger.debug(f"[{symbol}] ✅ Gate 4 PASSED — Sentiment {sent['label']}")
+            logger.debug(
+                f"[{symbol}] ✅ Gate 4 PASSED — Sentiment {sent['label']}"
+            )
 
         # ── Gate 5 — Intermarket (Day Trader only) ────────────────────────────
         if self.style == "scalper":
@@ -393,7 +546,9 @@ class ForexSystem:
             if signal.signal.value == "SELL" and inter["score"] > 0.1:
                 logger.debug(f"[{symbol}] ⛔ Gate 5 BLOCKED — Intermarket bullish")
                 return
-            logger.debug(f"[{symbol}] ✅ Gate 5 PASSED — Intermarket {inter['score']:+.3f}")
+            logger.debug(
+                f"[{symbol}] ✅ Gate 5 PASSED — Intermarket {inter['score']:+.3f}"
+            )
 
         # ── Gate 6 — COT (Day Trader only) ───────────────────────────────────
         if self.style == "scalper":
@@ -407,11 +562,14 @@ class ForexSystem:
             if signal.signal.value == "SELL" and cot["bias"] == "Bullish":
                 logger.debug(f"[{symbol}] ⛔ Gate 6 BLOCKED — COT Bullish vs SELL")
                 return
-            logger.debug(f"[{symbol}] ✅ Gate 6 PASSED — COT bias={cot['bias']}")
+            logger.debug(
+                f"[{symbol}] ✅ Gate 6 PASSED — COT bias={cot['bias']}"
+            )
 
         # ── All gates passed — fire alert ─────────────────────────────────────
         logger.info(
-            f"🚀 ALL GATES PASSED — firing {signal.signal.value} alert on {symbol}"
+            f"🚀 ALL GATES PASSED — firing {signal.signal.value} alert on {symbol} "
+            f"(TF=M{tf})"
         )
 
         direction = signal.signal.value
@@ -454,7 +612,7 @@ class ForexSystem:
             win_rate  = ml["confidence"],
         )
         if spec is None:
-            logger.warning(f"[{symbol}] ⚠️ Position sizing rejected — skipping trade")
+            logger.warning(f"[{symbol}] ⚠️  Position sizing rejected — skipping trade")
             return
 
         result = self.executor.send_market_order(spec)
@@ -473,18 +631,76 @@ class ForexSystem:
             )
             logger.info(
                 f"✅ Order placed: {direction} {symbol} "
-                f"lot={spec.volume:.2f} risk=€{spec.risk_usd:.2f}"
+                f"lot={spec.volume:.2f} risk=€{spec.risk_usd:.2f} "
+                f"TF=M{tf}"
             )
+
+            # ── FIX 2: Register position in tracking dict ─────────────────────
+            self._open_positions[result["ticket"]] = {
+                "symbol":    symbol,
+                "direction": direction,
+                "entry":     result["price"],
+                "sl":        spec.sl,
+                "tp":        spec.tp,
+                "volume":    spec.volume,
+            }
         else:
             logger.warning(f"❌ Order failed: {symbol} {direction}")
 
     # ── position monitoring ───────────────────────────────────────────────────
     def _monitor_positions(self) -> None:
-        positions = mt5.positions_get(magic=CONFIG.MAGIC_NUMBER)
-        if not positions:
-            return
+        """
+        FIX 2: Broker-closed trade detection.
+        Runs every 30 seconds; detects TP/SL hits by comparing tracked
+        tickets against live MT5 positions.
+        """
+        live_positions = mt5.positions_get(magic=CONFIG.MAGIC_NUMBER) or []
+        live_tickets   = {p.ticket for p in live_positions}
 
-        for pos in positions:
+        closed_tickets = set(self._open_positions.keys()) - live_tickets
+        for ticket in closed_tickets:
+            tracked   = self._open_positions.pop(ticket)
+            symbol    = tracked["symbol"]
+            direction = tracked["direction"]
+            entry     = tracked["entry"]
+
+            pnl, close_px = self._get_closed_deal_info(
+                ticket, symbol, entry, direction
+            )
+
+            sym_info = mt5.symbol_info(symbol)
+            point    = sym_info.point if sym_info else 0.00001
+            pips     = (close_px - entry) / point / 10
+            if direction == "SELL":
+                pips = -pips
+
+            sl = tracked["sl"]
+            tp = tracked["tp"]
+            if tp and abs(close_px - tp) < point * 5:
+                reason = "TP hit"
+            elif sl and abs(close_px - sl) < point * 5:
+                reason = "SL hit"
+            else:
+                reason = "Broker closed"
+
+            logger.info(
+                f"📋 Broker-closed | {symbol} {direction} #{ticket} | "
+                f"{reason} | P&L: €{pnl:+.2f} | {pips:+.1f} pips"
+            )
+
+            self.alerts.trade_closed(
+                symbol=symbol, direction=direction, ticket=ticket,
+                entry=entry, close=close_px, pnl=pnl,
+                pips=round(pips, 1), reason=reason,
+            )
+            self.dashboard.log_trade(
+                symbol=symbol, direction=direction,
+                pnl=pnl, ticket=ticket,
+            )
+            self.risk_mgr.record_trade_result(pnl)
+
+        # ── Danger + TP proximity checks ──────────────────────────────────────
+        for pos in live_positions:
             symbol    = pos.symbol
             ticket    = pos.ticket
             direction = "BUY" if pos.type == 0 else "SELL"
@@ -504,7 +720,6 @@ class ForexSystem:
 
             pips_to_sl = abs(current - sl) / point / 10 if sl else 999
 
-            # ── Danger check ──────────────────────────────────────────────────
             danger_reasons: list = []
             if pips_to_sl <= 5:
                 danger_reasons.append(f"SL very close ({pips_to_sl:.1f} pips)")
@@ -533,8 +748,8 @@ class ForexSystem:
                             pnl=pnl, ticket=ticket,
                         )
                         self.risk_mgr.record_trade_result(pnl)
+                        self._open_positions.pop(ticket, None)
 
-            # ── TP proximity alert ────────────────────────────────────────────
             if tp:
                 pips_to_tp = abs(current - tp) / point / 10
                 if pips_to_tp <= 3:
@@ -544,6 +759,40 @@ class ForexSystem:
                         reasons=[f"Price within {pips_to_tp:.1f} pips of TP"],
                     )
 
+    # ── FIX 2: Deal history helper ────────────────────────────────────────────
+    def _get_closed_deal_info(
+        self,
+        ticket:    int,
+        symbol:    str,
+        entry:     float,
+        direction: str,
+    ) -> tuple:
+        try:
+            from datetime import timedelta
+            utc_now  = datetime.now(pytz.utc)
+            utc_from = utc_now - timedelta(hours=24)
+            deals = mt5.history_deals_get(utc_from, utc_now)
+            if deals:
+                for deal in deals:
+                    if deal.position_id == ticket and deal.entry == 1:
+                        return float(deal.profit), float(deal.price)
+        except Exception as e:
+            logger.debug(f"Deal history lookup failed for #{ticket}: {e}")
+
+        tick = mt5.symbol_info_tick(symbol)
+        sym_info = mt5.symbol_info(symbol)
+        if tick and sym_info:
+            close_px  = tick.bid if direction == "BUY" else tick.ask
+            point     = sym_info.point
+            pip_value = sym_info.trade_contract_size * point
+            pips      = (close_px - entry) / point
+            if direction == "SELL":
+                pips = -pips
+            pnl = pips * pip_value * 0.01
+            return round(pnl, 2), close_px
+
+        return 0.0, entry
+
     # ── trailing stops ────────────────────────────────────────────────────────
     def _update_trailing_stops(self) -> None:
         if self.mode not in ("2", "3"):
@@ -551,7 +800,6 @@ class ForexSystem:
         positions = mt5.positions_get(magic=CONFIG.MAGIC_NUMBER)
         if not positions:
             return
-
         trail_points = int(getattr(CONFIG, "TRAILING_STOP_PIPS", 15) * 10)
         for pos in positions:
             try:
@@ -600,9 +848,14 @@ class ForexSystem:
                     pnl=pnl, ticket=ticket,
                 )
                 self.risk_mgr.record_trade_result(pnl)
-                logger.info(f"  ✅ Closed {symbol} ticket={ticket} pnl=€{pnl:.2f}")
+                self._open_positions.pop(ticket, None)
+                logger.info(
+                    f"  ✅ Closed {symbol} ticket={ticket} pnl=€{pnl:.2f}"
+                )
             else:
-                logger.warning(f"  ❌ Could not close {symbol} ticket={ticket}")
+                logger.warning(
+                    f"  ❌ Could not close {symbol} ticket={ticket}"
+                )
 
     # ── daily summary ─────────────────────────────────────────────────────────
     def _daily_summary(self) -> None:
@@ -647,6 +900,8 @@ class ForexSystem:
                 if   key == "Q": self.stop()
                 elif key == "P":
                     self._paused = not self._paused
+                    status = "Paused" if self._paused else "Waiting"
+                    self.dashboard.update_scan_status(status)
                     print(f"\n  {'⏸  Paused' if self._paused else '▶  Resumed'}\n")
                 elif key == "S": self.alerts.sound.toggle()
                 elif key == "T": self.alerts.telegram.toggle()
@@ -655,11 +910,15 @@ class ForexSystem:
         threading.Thread(target=_listen, daemon=True).start()
 
     def _show_runtime_menu(self) -> None:
+        tf_label = (
+            f"M{CONFIG.SCALPER_TF_SELECTED}"
+            if self.style == "scalper" else "—"
+        )
         print("\n" + "─" * 40)
         print("  🎛  RUNTIME MENU")
         print("─" * 40)
         print(f"  Mode      : {self.mode} — {self.MODE_NAMES[self.mode]}")
-        print(f"  Style     : {self.style.title()}")
+        print(f"  Style     : {self.style.title()}  TF: {tf_label}")
         print(f"  Watchlist : {', '.join(CONFIG.WATCHLIST)}")
         print(f"  Sound     : {'ON' if self.alerts.sound.enabled else 'OFF'}")
         print(f"  TG        : {'ON' if self.alerts.telegram.enabled else 'OFF'}")

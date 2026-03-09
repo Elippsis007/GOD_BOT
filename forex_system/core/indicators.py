@@ -48,10 +48,71 @@ class IndicatorEngine:
     library versions.  All OHLCV column access uses lowercase names
     (open, high, low, close, volume) consistent with MT5Connector and
     DataHandler output.
+
+    FIX — Ichimoku lookahead bias eliminated:
+      pandas_ta.ichimoku() shifts Senkou Span A/B 26 bars forward by
+      default (standard charting convention).  This means bar[t] contains
+      cloud values computed from bars t+1..t+26 — pure future leakage.
+      Fixed by passing lookahead=False so cloud values are aligned to the
+      bar at which they were computed, not projected forward.
+
+    FIX — Profile-aware indicator periods:
+      _resolve_periods() reads the active scalper profile at compute_all()
+      time so switching M1 ↔ M5 at the startup menu automatically uses
+      the correct EMA / RSI / ATR / MACD / BB / ADX periods without
+      needing to reinstantiate IndicatorEngine.
     """
 
     def __init__(self, config=CONFIG):
         self.cfg = config
+
+    # ── Period resolver — reads active profile at compute time ───────────────
+    def _resolve_periods(self) -> dict:
+        """
+        Return the correct indicator periods for the currently active
+        trading profile.
+
+        For scalper mode reads CONFIG.get_scalper_profile() which returns
+        either the M1 or M5 block depending on CONFIG.SCALPER_TF_SELECTED.
+        Falls back to CONFIG flat attributes (day-trader / defaults) if
+        the scalper profile is unavailable.
+
+        Returns a flat dict with keys:
+            ema_fast, ema_slow, ema_trend,
+            rsi_period, macd_fast, macd_slow, macd_signal,
+            bb_period, bb_std, atr_period, adx_period
+        """
+        try:
+            p = self.cfg.get_scalper_profile()
+            return {
+                "ema_fast":    p.get("ema_fast",    self.cfg.EMA_FAST),
+                "ema_slow":    p.get("ema_slow",    self.cfg.EMA_SLOW),
+                "ema_trend":   p.get("ema_trend",   self.cfg.EMA_TREND),
+                "rsi_period":  p.get("rsi_period",  self.cfg.RSI_PERIOD),
+                "macd_fast":   p.get("macd_fast",   self.cfg.MACD_FAST),
+                "macd_slow":   p.get("macd_slow",   self.cfg.MACD_SLOW),
+                "macd_signal": p.get("macd_signal", self.cfg.MACD_SIGNAL),
+                "bb_period":   p.get("bb_period",   self.cfg.BB_PERIOD),
+                "bb_std":      p.get("bb_std",      self.cfg.BB_STD),
+                "atr_period":  p.get("atr_period",  self.cfg.ATR_PERIOD),
+                "adx_period":  p.get("adx_period",  self.cfg.ADX_PERIOD
+                               if hasattr(self.cfg, "ADX_PERIOD") else 10),
+            }
+        except Exception:
+            # Fallback — use flat CONFIG attributes (day-trader or defaults)
+            return {
+                "ema_fast":    self.cfg.EMA_FAST,
+                "ema_slow":    self.cfg.EMA_SLOW,
+                "ema_trend":   self.cfg.EMA_TREND,
+                "rsi_period":  self.cfg.RSI_PERIOD,
+                "macd_fast":   self.cfg.MACD_FAST,
+                "macd_slow":   self.cfg.MACD_SLOW,
+                "macd_signal": self.cfg.MACD_SIGNAL,
+                "bb_period":   self.cfg.BB_PERIOD,
+                "bb_std":      self.cfg.BB_STD,
+                "atr_period":  self.cfg.ATR_PERIOD,
+                "adx_period":  getattr(self.cfg, "ADX_PERIOD", 10),
+            }
 
     def compute_all(self, df: pd.DataFrame) -> Optional[pd.DataFrame]:
         """Master method — adds all indicator columns and drops NaN rows."""
@@ -59,30 +120,26 @@ class IndicatorEngine:
             logger.warning("Empty DataFrame passed to IndicatorEngine")
             return None
 
-        # FIX: normalise column names to lowercase so this engine works
-        # regardless of whether the caller used connector.get_ohlcv() (now
-        # lowercase) or an older code path that used Title Case.
         df = df.copy()
         df.columns = df.columns.str.lower()
 
-        # Verify required base columns are present after normalisation
         required = {"open", "high", "low", "close"}
         missing  = required - set(df.columns)
         if missing:
             logger.error(f"IndicatorEngine: missing required columns {missing}")
             return None
 
-        df = self._trend_indicators(df)
-        df = self._momentum_indicators(df)
-        df = self._volatility_indicators(df)
+        # Resolve indicator periods from active profile at compute time
+        periods = self._resolve_periods()
+
+        df = self._trend_indicators(df, periods)
+        df = self._momentum_indicators(df, periods)
+        df = self._volatility_indicators(df, periods)
         df = self._volume_indicators(df)
         df = self._market_structure(df)
 
         df.dropna(inplace=True)
 
-        # FIX: guard against an empty result after dropna — return None with
-        # a warning so callers skip processing rather than operating on an
-        # empty DataFrame silently.
         if len(df) < MIN_BARS_AFTER_DROPNA:
             logger.warning(
                 f"IndicatorEngine: only {len(df)} rows remain after dropna "
@@ -93,20 +150,18 @@ class IndicatorEngine:
         return df
 
     # ── Trend ─────────────────────────────────────────────────────────────────
-    def _trend_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        # FIX: all column references changed from Title Case to lowercase
+    def _trend_indicators(self, df: pd.DataFrame, p: dict) -> pd.DataFrame:
+        # EMAs — periods from active profile
+        df["ema_fast"]  = ta.ema(df["close"], length=p["ema_fast"])
+        df["ema_slow"]  = ta.ema(df["close"], length=p["ema_slow"])
+        df["ema_trend"] = ta.ema(df["close"], length=p["ema_trend"])
 
-        # EMAs
-        df["ema_fast"]  = ta.ema(df["close"], length=self.cfg.EMA_FAST)
-        df["ema_slow"]  = ta.ema(df["close"], length=self.cfg.EMA_SLOW)
-        df["ema_trend"] = ta.ema(df["close"], length=self.cfg.EMA_TREND)
-
-        # MACD
+        # MACD — periods from active profile
         macd = ta.macd(
             df["close"],
-            fast   = self.cfg.MACD_FAST,
-            slow   = self.cfg.MACD_SLOW,
-            signal = self.cfg.MACD_SIGNAL,
+            fast   = p["macd_fast"],
+            slow   = p["macd_slow"],
+            signal = p["macd_signal"],
         )
         if macd is not None:
             df["macd"]        = _col(macd, "MACD_")
@@ -115,8 +170,8 @@ class IndicatorEngine:
         else:
             df["macd"] = df["macd_signal"] = df["macd_hist"] = np.nan
 
-        # ADX
-        adx = ta.adx(df["high"], df["low"], df["close"])
+        # ADX — period from active profile
+        adx = ta.adx(df["high"], df["low"], df["close"], length=p["adx_period"])
         if adx is not None:
             df["adx"]    = _col(adx, "ADX_")
             df["di_pos"] = _col(adx, "DMP_")
@@ -124,9 +179,27 @@ class IndicatorEngine:
         else:
             df["adx"] = df["di_pos"] = df["di_neg"] = np.nan
 
-        # Ichimoku
+        # ── Ichimoku — FIX: lookahead=False eliminates Senkou Span leakage ──
+        #
+        # DEFAULT behaviour (lookahead=True / not set):
+        #   pandas_ta shifts Senkou Span A and B 26 bars FORWARD so the
+        #   cloud appears projected ahead on a chart.  At bar[t] this means
+        #   senkou_a[t] = value computed from bars up to t+26 — future data.
+        #   This leaks into both the ML training features (in_cloud,
+        #   above_cloud) and the signal engine cloud checks.
+        #
+        # FIX (lookahead=False):
+        #   Cloud values are aligned to the bar at which they were computed.
+        #   senkou_a[t] = average of tenkan[t] and kijun[t] at that bar.
+        #   No future bars are referenced — fully causal.
+        #
+        # Tenkan-sen and Kijun-sen are NOT affected by lookahead — they are
+        # always computed from bars up to and including t.
         try:
-            ich    = ta.ichimoku(df["high"], df["low"], df["close"])
+            ich    = ta.ichimoku(
+                df["high"], df["low"], df["close"],
+                lookahead=False,   # ← THE FIX
+            )
             ich_df = ich[0] if isinstance(ich, tuple) else ich
             if ich_df is not None:
                 df["tenkan"]   = _col(ich_df, "ITS_")
@@ -144,13 +217,11 @@ class IndicatorEngine:
         return df
 
     # ── Momentum ──────────────────────────────────────────────────────────────
-    def _momentum_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        # FIX: all column references changed from Title Case to lowercase
+    def _momentum_indicators(self, df: pd.DataFrame, p: dict) -> pd.DataFrame:
+        # RSI — period from active profile
+        df["rsi"] = ta.rsi(df["close"], length=p["rsi_period"])
 
-        # RSI
-        df["rsi"] = ta.rsi(df["close"], length=self.cfg.RSI_PERIOD)
-
-        # Stochastic
+        # Stochastic — fixed periods (standard 14,3,3 — not profile-dependent)
         stoch = ta.stoch(df["high"], df["low"], df["close"])
         if stoch is not None:
             df["stoch_k"] = _col(stoch, "STOCHk_")
@@ -167,14 +238,12 @@ class IndicatorEngine:
         return df
 
     # ── Volatility ────────────────────────────────────────────────────────────
-    def _volatility_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        # FIX: all column references changed from Title Case to lowercase
-
-        # Bollinger Bands
+    def _volatility_indicators(self, df: pd.DataFrame, p: dict) -> pd.DataFrame:
+        # Bollinger Bands — periods from active profile
         bb = ta.bbands(
             df["close"],
-            length = self.cfg.BB_PERIOD,
-            std    = self.cfg.BB_STD,
+            length = p["bb_period"],
+            std    = p["bb_std"],
         )
         if bb is not None:
             df["bb_upper"] = _col(bb, "BBU_")
@@ -185,13 +254,13 @@ class IndicatorEngine:
             df["bb_upper"] = df["bb_mid"] = \
             df["bb_lower"] = df["bb_width"] = np.nan
 
-        # ATR
+        # ATR — period from active profile
         df["atr"] = ta.atr(
             df["high"], df["low"], df["close"],
-            length=self.cfg.ATR_PERIOD,
+            length=p["atr_period"],
         )
 
-        # Keltner Channel
+        # Keltner Channel — fixed periods (used only for squeeze detection)
         try:
             kc = ta.kc(df["high"], df["low"], df["close"])
             if kc is not None:
@@ -207,32 +276,24 @@ class IndicatorEngine:
 
     # ── Volume ────────────────────────────────────────────────────────────────
     def _volume_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        # FIX: all column references changed from Title Case to lowercase
-        # volume column is now guaranteed lowercase after compute_all normalises
-
-        vol = df.get("volume")   # returns None if column absent
+        vol = df.get("volume")
 
         try:
-            if vol is not None:
-                df["obv"] = ta.obv(df["close"], vol)
-            else:
-                df["obv"] = np.nan
+            df["obv"] = ta.obv(df["close"], vol) if vol is not None else np.nan
         except Exception:
             df["obv"] = np.nan
 
         try:
-            if vol is not None:
-                df["cmf"] = ta.cmf(df["high"], df["low"], df["close"], vol)
-            else:
-                df["cmf"] = np.nan
+            df["cmf"] = ta.cmf(
+                df["high"], df["low"], df["close"], vol
+            ) if vol is not None else np.nan
         except Exception:
             df["cmf"] = np.nan
 
         try:
-            if vol is not None:
-                df["vwap"] = ta.vwap(df["high"], df["low"], df["close"], vol)
-            else:
-                df["vwap"] = np.nan
+            df["vwap"] = ta.vwap(
+                df["high"], df["low"], df["close"], vol
+            ) if vol is not None else np.nan
         except Exception:
             df["vwap"] = np.nan
 
@@ -240,10 +301,6 @@ class IndicatorEngine:
 
     # ── Market Structure ──────────────────────────────────────────────────────
     def _market_structure(self, df: pd.DataFrame) -> pd.DataFrame:
-        # FIX: all column references changed from Title Case to lowercase
-
-        # FIX: replace ATR with a zero-safe denominator to prevent inf / NaN
-        # propagation when ATR is zero during the warmup period.
         atr_safe = df["atr"].replace(0, np.nan)
 
         df["price_vs_ema_fast"] = (df["close"] - df["ema_fast"]) / atr_safe

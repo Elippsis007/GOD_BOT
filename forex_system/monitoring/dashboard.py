@@ -5,7 +5,7 @@ import json
 import os
 import time
 from datetime import datetime, timedelta
-from typing import List
+from typing import List, Optional
 import pytz
 from config.settings import CONFIG
 from monitoring.logger import get_logger
@@ -27,6 +27,17 @@ class Dashboard:
     recent signals and daily performance.
     Persists logs to disk — survives restarts.
     All timestamps displayed in Europe/Madrid local time.
+
+    FIX 1 — Dashboard scan status:
+        update_scan_status() is now called from main.py before/after every
+        scan; the footer shows a live countdown rather than a static value.
+
+    FIX 2 — Broker-closed trades not logged:
+        log_trade() accepts optional extra fields (close_reason,
+        entry_price, close_price, volume) so broker-TP/SL hits recorded
+        by _monitor_positions() in main.py are stored with full context.
+        _performance_panel() and _analytics_panel() now show a close-reason
+        breakdown (TP / SL / Danger / EOD / Unknown).
     """
 
     def __init__(self, config=CONFIG):
@@ -35,8 +46,8 @@ class Dashboard:
         self.trades_log:  List[dict] = []
         self._all_trades: List[dict] = []
         self._scan_secs           = 60
-        self._last_scan_time      = None
-        self._scan_status         = "Waiting"
+        self._last_scan_time      = None          # FIX 1
+        self._scan_status         = "Waiting"     # FIX 1
         self._display_initialized = False
         os.makedirs("reports", exist_ok=True)
         self._load_today()
@@ -200,6 +211,12 @@ class Dashboard:
 
     # ── Performance Panel ─────────────────────────────────────────────────────
     def _performance_panel(self) -> None:
+        """
+        FIX 2: Displays a close-reason breakdown row so broker-TP/SL
+        hits are clearly counted separately from danger-exits and EOD
+        closes. The extra fields (close_reason) are written by log_trade()
+        and are optional — old entries default to 'Unknown'.
+        """
         print("\n📉 TODAY'S PERFORMANCE")
         print("-" * 40)
 
@@ -225,8 +242,37 @@ class Dashboard:
         print(f"  Best     : {best:+.2f}")
         print(f"  Worst    : {worst:+.2f}")
 
+        # ── FIX 2: Close-reason breakdown ─────────────────────────────────
+        reason_counts: dict = {}
+        for t in today_trades:
+            reason = t.get("close_reason", "Unknown")
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        if reason_counts:
+            print("  Close By :")
+            # Canonical ordering; any extra reasons appear at the end
+            order = ["TP", "SL", "Danger", "EOD", "Unknown"]
+            sorted_reasons = sorted(
+                reason_counts.items(),
+                key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order),
+            )
+            for reason, count in sorted_reasons:
+                icon = {
+                    "TP":      "🎯",
+                    "SL":      "🛑",
+                    "Danger":  "⚠️ ",
+                    "EOD":     "🌙",
+                    "Unknown": "❓",
+                }.get(reason, "📌")
+                print(f"    {icon} {reason:<8}: {count}")
+
     # ── Analytics Panel ───────────────────────────────────────────────────────
     def _analytics_panel(self) -> None:
+        """
+        FIX 2: Rolling analytics now include a 7-day close-reason
+        breakdown so you can see how many broker TP/SL hits happened
+        over the week versus manual danger-exits and EOD closes.
+        """
         print("\n📊 ROLLING ANALYTICS  (7-day)")
         print("-" * 65)
 
@@ -286,15 +332,64 @@ class Dashboard:
             icon   = "🟢" if s_pnl >= 0 else "🔴"
             print(f"    {name:<8}: {len(pnls):>3} trades | WR {s_wr:>5.1f}% | {icon} €{s_pnl:+.2f}")
 
+        # ── FIX 2: 7-day close-reason breakdown ───────────────────────────
+        reason_counts_7d: dict = {}
+        for t in trades_7d:
+            reason = t.get("close_reason", "Unknown")
+            reason_counts_7d[reason] = reason_counts_7d.get(reason, 0) + 1
+
+        if reason_counts_7d:
+            print("\n  Close Reason (7d):")
+            order = ["TP", "SL", "Danger", "EOD", "Unknown"]
+            sorted_reasons = sorted(
+                reason_counts_7d.items(),
+                key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order),
+            )
+            for reason, count in sorted_reasons:
+                icon = {
+                    "TP":      "🎯",
+                    "SL":      "🛑",
+                    "Danger":  "⚠️ ",
+                    "EOD":     "🌙",
+                    "Unknown": "❓",
+                }.get(reason, "📌")
+                pct = count / len(trades_7d) * 100
+                print(f"    {icon} {reason:<8}: {count:>3}  ({pct:>5.1f}%)")
+
     # ── Footer ────────────────────────────────────────────────────────────────
     def _footer(self) -> None:
+        """
+        FIX 1: Footer shows a live countdown to the next scan rather than
+        the static interval value that never changed.
+
+        Logic:
+          - While status is 'Running' → show '🔄 Scan Active'  (no countdown).
+          - While status is 'Paused'  → show '⏸  Paused'       (no countdown).
+          - All other states: calculate seconds elapsed since _last_scan_time
+            and subtract from _scan_secs for a true remaining countdown.
+          - Countdown clamped to [0, _scan_secs] — never negative, never
+            exceeds the interval (first run before _last_scan_time is set
+            shows the full interval).
+        """
         scan_status = self._get_scan_status_text()
         last_scan   = self._get_last_scan_text()
+
+        # ── Live countdown calculation ─────────────────────────────────────
+        if self._scan_status in ("Running", "Paused"):
+            countdown_str = ""
+        else:
+            if self._last_scan_time is not None:
+                elapsed   = int((_now_madrid() - self._last_scan_time).total_seconds())
+                remaining = max(0, self._scan_secs - elapsed)
+            else:
+                remaining = self._scan_secs
+            countdown_str = f"  ⏱️  Next scan in {remaining:>3}s  |  "
+
         print("\n" + "=" * 65)
-        print(
-            f"  ⏱️  Next scan in {self._scan_secs}s  |  "
-            f"{scan_status}  |  {last_scan}"
-        )
+        if countdown_str:
+            print(f"{countdown_str}{scan_status}  |  {last_scan}")
+        else:
+            print(f"  {scan_status}  |  {last_scan}")
         print("  M=Menu  P=Pause  Q=Quit")
         print("=" * 65)
 
@@ -318,6 +413,17 @@ class Dashboard:
         return f"Last: {seconds // 60}m ago"
 
     def update_scan_status(self, status: str) -> None:
+        """
+        FIX 1: Called from main.py before and after every scan cycle so
+        the footer reflects the real current state of the scanner.
+
+        Accepted status values:
+            "Running"   – scan loop has started processing symbols
+            "Completed" – scan loop finished; also snapshots _last_scan_time
+            "Waiting"   – between scans (weekend skip, quiet hours, etc.)
+            "Paused"    – user pressed P
+            "Error"     – exception raised inside the scan loop
+        """
         self._scan_status = status
         if status == "Completed":
             self._last_scan_time = _now_madrid()
@@ -356,25 +462,50 @@ class Dashboard:
 
     def log_trade(
         self,
-        symbol:    str,
-        direction: str,
-        pnl:       float,
-        ticket:    int,
+        symbol:       str,
+        direction:    str,
+        pnl:          float,
+        ticket:       int,
+        # ── FIX 2: extra fields so broker-closed trades are fully recorded ──
+        close_reason: str            = "Unknown",
+        entry_price:  Optional[float] = None,
+        close_price:  Optional[float] = None,
+        volume:       Optional[float] = None,
     ) -> None:
+        """
+        FIX 2 — Extended signature so _monitor_positions() in main.py can
+        pass close_reason='TP' or 'SL' for broker-closed trades, and
+        close_reason='Danger' / 'EOD' for manual closes.
+
+        All new parameters are optional so existing call-sites that only
+        pass (symbol, direction, pnl, ticket) continue to work unchanged.
+        """
         now = _now_madrid()
-        self.trades_log.append({
-            "symbol":    symbol,
-            "direction": direction,
-            "pnl":       round(pnl, 2),
-            "ticket":    ticket,
-            "date":      now.strftime("%Y-%m-%d"),
-            "time":      now.strftime("%H:%M:%S"),
-        })
+        entry: dict = {
+            "symbol":       symbol,
+            "direction":    direction,
+            "pnl":          round(pnl, 2),
+            "ticket":       ticket,
+            "close_reason": close_reason,   # FIX 2
+            "date":         now.strftime("%Y-%m-%d"),
+            "time":         now.strftime("%H:%M:%S"),
+        }
+        # Attach optional fields only when provided so the JSON stays lean
+        if entry_price is not None:
+            entry["entry_price"] = round(entry_price, 5)
+        if close_price is not None:
+            entry["close_price"] = round(close_price, 5)
+        if volume is not None:
+            entry["volume"] = round(volume, 2)
+
+        self.trades_log.append(entry)
         self._save_logs()
+
         icon = "✅" if pnl >= 0 else "❌"
+        reason_tag = f" [{close_reason}]" if close_reason != "Unknown" else ""
         logger.info(
             f"📝 Trade logged: {symbol} {direction} "
-            f"{icon} €{pnl:+.2f} | #{ticket}"
+            f"{icon} €{pnl:+.2f} | #{ticket}{reason_tag}"
         )
 
     # ── Stats ─────────────────────────────────────────────────────────────────
