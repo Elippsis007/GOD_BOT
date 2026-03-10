@@ -3,10 +3,8 @@ import requests
 import threading
 import pytz
 from datetime import datetime
-from monitoring.logger import get_logger
+from monitoring.logger import logger
 from config.settings   import CONFIG
-
-logger = get_logger("TelegramAlerts")
 
 
 def _escape(text: str) -> str:
@@ -37,7 +35,14 @@ class TelegramAlerts:
         self.enabled   = True
         self.chat_id   = CONFIG.TELEGRAM_CHAT_ID
         self.timezone  = pytz.timezone("Europe/Madrid")
+        self._tz_utc   = pytz.utc
         self._cooldowns: dict = {}
+
+        # Fix 1 – Defer currency fetch until MT5 is connected.
+        # Previously called MT5Connector().get_account_info() here which
+        # fired before MT5 was connected and logged an error on every startup.
+        # _get_currency() is now called lazily on first alert instead.
+        self._currency = "EUR"  # safe default until MT5 connects
 
         if not self._token:
             logger.warning("⚠️ TELEGRAM_TOKEN is empty — alerts disabled")
@@ -45,6 +50,23 @@ class TelegramAlerts:
             return
 
         self._test_connection()
+
+    # ── Currency (lazy fetch) ─────────────────────────────────────────────────
+    def _get_currency(self) -> str:
+        """
+        Fetch account currency from MT5 on first call after connection.
+        Result is cached in self._currency so MT5 is only queried once.
+        """
+        if self._currency != "EUR":
+            return self._currency
+        try:
+            from core.mt5_connector import MT5Connector
+            info = MT5Connector().get_account_info()
+            if info:
+                self._currency = info.get("currency", "EUR")
+        except Exception:
+            pass
+        return self._currency
 
     # ── Connection Test ───────────────────────────────────────────────────────
     def _test_connection(self) -> bool:
@@ -136,10 +158,12 @@ class TelegramAlerts:
     def _in_cooldown(self, key: str, secs: int) -> bool:
         if key not in self._cooldowns:
             return False
-        return (datetime.now() - self._cooldowns[key]).total_seconds() < secs
+        return (
+            datetime.now(self._tz_utc) - self._cooldowns[key]
+        ).total_seconds() < secs
 
     def _set_cooldown(self, key: str) -> None:
-        self._cooldowns[key] = datetime.now()
+        self._cooldowns[key] = datetime.now(self._tz_utc)
 
     # ── Time Helper ───────────────────────────────────────────────────────────
     def _now(self) -> str:
@@ -160,6 +184,10 @@ class TelegramAlerts:
         reasons:    list,
     ) -> None:
         if confidence < CONFIG.ALERT_MIN_CONFIDENCE:
+            logger.debug(
+                f"BUY alert suppressed — confidence {confidence:.2f} "
+                f"below minimum {CONFIG.ALERT_MIN_CONFIDENCE:.2f}"
+            )
             return
         if not self._can_send(
             alert_type="buy_signal",
@@ -200,6 +228,10 @@ class TelegramAlerts:
         reasons:    list,
     ) -> None:
         if confidence < CONFIG.ALERT_MIN_CONFIDENCE:
+            logger.debug(
+                f"SELL alert suppressed — confidence {confidence:.2f} "
+                f"below minimum {CONFIG.ALERT_MIN_CONFIDENCE:.2f}"
+            )
             return
         if not self._can_send(
             alert_type="sell_signal",
@@ -246,13 +278,14 @@ class TelegramAlerts:
         ):
             return
 
+        cur  = self._get_currency()
         icon = "🟢" if pnl >= 0 else "🔴"
         msg  = (
             f"⏸️ <b>HOLD — {_escape(symbol)} {direction}</b>\n"
             f"⏰ {self._now()}\n\n"
             f"Opened  : {entry}\n"
             f"Current : {current}\n"
-            f"P&L     : {icon} {pips:+.1f} pips (€{pnl:+.2f})\n"
+            f"P&L     : {icon} {pips:+.1f} pips ({cur}{pnl:+.2f})\n"
             f"Target  : {tp} ({pips_left:.1f} pips left)\n\n"
             f"✅ Signal still valid — hold position"
         )
@@ -279,6 +312,7 @@ class TelegramAlerts:
         ):
             return
 
+        cur          = self._get_currency()
         reasons_text = "\n".join(f"  ⚠️ {_escape(r)}" for r in reasons)
         msg = (
             f"🟡 <b>CONSIDER EXIT — {_escape(symbol)}</b>\n"
@@ -287,7 +321,7 @@ class TelegramAlerts:
             f"Opened    : {entry}\n"
             f"Current   : {current}\n"
             f"TP Target : {tp}\n"
-            f"P&L       : €{pnl:+.2f}\n\n"
+            f"P&L       : {cur}{pnl:+.2f}\n\n"
             f"Near TP:\n{reasons_text}\n\n"
             f"💡 A) Close now\n"
             f"   B) Move SL to breakeven\n"
@@ -308,22 +342,22 @@ class TelegramAlerts:
         sl:        float,
         reasons:   list,
     ) -> None:
-        # Danger bypasses quiet hours — too critical to suppress
         if not self.enabled:
+            return
+        if not CONFIG.TELEGRAM_SEND_DANGER:
             return
         if self._in_cooldown(f"danger_{ticket}", CONFIG.ALERT_COOLDOWN_DANGER):
             return
         self._set_cooldown(f"danger_{ticket}")
-        if not CONFIG.TELEGRAM_SEND_DANGER:
-            return
 
+        cur          = self._get_currency()
         reasons_text = "\n".join(f"  ❌ {_escape(r)}" for r in reasons)
         msg = (
             f"🚨 <b>⚠️ DANGER — {_escape(symbol)} {direction}</b>\n"
             f"⏰ {self._now()}\n\n"
             f"Opened  : {entry}\n"
             f"Current : {current}\n"
-            f"P&L     : 🔴 €{pnl:.2f}\n"
+            f"P&L     : 🔴 {cur}{pnl:.2f}\n"
             f"SL      : {sl}\n\n"
             f"Danger signals:\n{reasons_text}\n\n"
             f"⚡ <b>URGENT — Consider closing NOW</b>"
@@ -331,7 +365,7 @@ class TelegramAlerts:
         self._send(msg)
         logger.info("📱 DANGER alert → Telegram ✅")
 
-    # ── Risk Warning ─────────────────────────────────────────────────────────
+    # ── Risk Warning ──────────────────────────────────────────────────────────
     def risk_warning(
         self,
         level:        str,
@@ -342,46 +376,31 @@ class TelegramAlerts:
         open_trades:  int   = 0,
         max_trades:   int   = 0,
     ) -> None:
-        """
-        Risk limit notifications — always bypass quiet hours.
-        These are too important to suppress overnight.
-
-        Levels and their Telegram messages:
-          WARNING     — daily loss at 75% — amber alert
-          URGENT      — daily loss at 90% — red alert
-          LIMIT_HIT   — trading halted for today
-          TRADES_NEAR — 2 of 3 slots used
-          TRADES_FULL — all slots full, signal blocked
-          LOW_MARGIN  — free margin too low
-        """
-        # Risk warnings always bypass quiet hours
         if not self.enabled:
             return
 
-        # Cooldown — LIMIT_HIT/URGENT every 3 min, others every 10 min
         cooldown = 180 if level in ("LIMIT_HIT", "URGENT") else 600
         key      = f"risk_{level}"
         if self._in_cooldown(key, cooldown):
             return
         self._set_cooldown(key)
 
-        # ── Build progress bar for loss-based alerts ──────────────────────────
+        cur      = self._get_currency()
         bar_line = ""
         if level in ("WARNING", "URGENT", "LIMIT_HIT") and daily_limit > 0:
             filled   = min(int(pct_used / 10), 10)
             bar      = "█" * filled + "░" * (10 - filled)
             bar_line = (
                 f"\nLoss Used : [{bar}] {pct_used:.0f}%\n"
-                f"Lost      : €{abs(daily_pnl):.2f} of €{daily_limit:.2f}\n"
-                f"Remaining : €{max(daily_limit - abs(daily_pnl), 0):.2f}"
+                f"Lost      : {cur}{abs(daily_pnl):.2f} of "
+                f"{cur}{daily_limit:.2f}\n"
+                f"Remaining : {cur}{max(daily_limit - abs(daily_pnl), 0):.2f}"
             )
 
-        # ── Build slot line for trade-count alerts ────────────────────────────
         slot_line = ""
         if level in ("TRADES_NEAR", "TRADES_FULL") and max_trades > 0:
             slot_line = f"\nSlots Used: {open_trades} / {max_trades}"
 
-        # ── Icon and title per level ──────────────────────────────────────────
         headers = {
             "WARNING":     "⚠️ RISK WARNING — Daily Loss 75%",
             "URGENT":      "⛔ URGENT — Daily Loss 90%",
@@ -445,6 +464,8 @@ class TelegramAlerts:
         entry:     float,
         sl:        float,
         tp:        float,
+        sl_pips:   float,
+        tp_pips:   float,
         volume:    float,
         risk:      float,
         style:     str,
@@ -453,21 +474,22 @@ class TelegramAlerts:
         if not self._can_send(
             alert_type="opened",
             enabled_flag=CONFIG.TELEGRAM_SEND_OPENED,
-            cooldown_secs=60,
+            cooldown_secs=CONFIG.ALERT_COOLDOWN_OPENED,
             key=str(ticket),
         ):
             return
 
+        cur  = self._get_currency()
         icon = "🟢" if direction == "BUY" else "🔴"
         msg  = (
             f"{icon} <b>TRADE OPENED — {_escape(symbol)}</b>\n"
             f"⏰ {self._now()}\n\n"
             f"Direction : <b>{direction}</b>\n"
             f"Entry     : {entry}\n"
-            f"SL        : {sl}\n"
-            f"TP        : {tp}\n"
+            f"SL        : {sl} ({sl_pips:.1f} pips)\n"
+            f"TP        : {tp} ({tp_pips:.1f} pips)\n"
             f"Volume    : {volume} lots\n"
-            f"Risk      : €{risk:.2f}\n"
+            f"Risk      : {cur}{risk:.2f}\n"
             f"Ticket    : #{ticket}\n"
             f"Style     : {_escape(style.title())}\n\n"
             f"✅ Trade placed successfully"
@@ -478,23 +500,24 @@ class TelegramAlerts:
     # ── Trade Closed ──────────────────────────────────────────────────────────
     def trade_closed(
         self,
-        symbol:    str,
-        direction: str,
-        ticket:    int,
-        entry:     float,
-        close:     float,
-        pnl:       float,
-        pips:      float,
-        reason:    str,
+        symbol:      str,
+        direction:   str,
+        ticket:      int,
+        entry:       float,
+        close_price: float,
+        pnl:         float,
+        pips:        float,
+        reason:      str,
     ) -> None:
         if not self._can_send(
             alert_type="closed",
             enabled_flag=CONFIG.TELEGRAM_SEND_CLOSED,
-            cooldown_secs=60,
+            cooldown_secs=CONFIG.ALERT_COOLDOWN_CLOSED,
             key=str(ticket),
         ):
             return
 
+        cur   = self._get_currency()
         icon  = "✅" if pnl >= 0 else "❌"
         emoji = "🎉" if pnl > 0 else "💪"
         msg   = (
@@ -502,8 +525,8 @@ class TelegramAlerts:
             f"⏰ {self._now()}\n\n"
             f"Direction : {direction}\n"
             f"Opened    : {entry}\n"
-            f"Closed    : {close}\n"
-            f"Result    : <b>{pips:+.1f} pips (€{pnl:+.2f})</b>\n"
+            f"Closed    : {close_price}\n"
+            f"Result    : <b>{pips:+.1f} pips ({cur}{pnl:+.2f})</b>\n"
             f"Reason    : {_escape(reason)}\n"
             f"Ticket    : #{ticket}\n\n"
             f"{emoji} {'Great trade!' if pnl > 0 else 'On to the next one!'}"
@@ -527,12 +550,12 @@ class TelegramAlerts:
         balance:      float = 0.0,
         date:         str   = "",
     ) -> None:
-        # Daily summary always sends regardless of quiet hours
         if not self.enabled:
             return
         if not CONFIG.TELEGRAM_SEND_SUMMARY:
             return
 
+        cur      = self._get_currency()
         today    = date or datetime.now(self.timezone).strftime("%d %b %Y")
         pnl_icon = "📈" if net_pnl >= 0 else "📉"
         msg      = (
@@ -543,12 +566,12 @@ class TelegramAlerts:
             f"Winners    : {winners} ✅\n"
             f"Losers     : {losers} ❌\n"
             f"Win Rate   : {win_rate:.0f}%\n\n"
-            f"Gross P    : €{gross_profit:+.2f}\n"
-            f"Gross L    : €{gross_loss:+.2f}\n"
-            f"Net P&L    : {pnl_icon} <b>€{net_pnl:+.2f}</b>\n\n"
-            f"Best Trade : €{best_trade:+.2f}\n"
-            f"Worst Trade: €{worst_trade:+.2f}\n"
-            f"Balance    : €{balance:,.2f}"
+            f"Gross P    : {cur}{gross_profit:+.2f}\n"
+            f"Gross L    : {cur}{gross_loss:+.2f}\n"
+            f"Net P&L    : {pnl_icon} <b>{cur}{net_pnl:+.2f}</b>\n\n"
+            f"Best Trade : {cur}{best_trade:+.2f}\n"
+            f"Worst Trade: {cur}{worst_trade:+.2f}\n"
+            f"Balance    : {cur}{balance:,.2f}"
         )
         self._send(msg)
         logger.info("📱 DAILY SUMMARY → Telegram ✅")
@@ -562,13 +585,16 @@ class TelegramAlerts:
     ) -> None:
         if not self.enabled:
             return
+
+        cur           = self._get_currency()
+        watchlist_str = ", ".join(CONFIG.SYMBOLS) if CONFIG.SYMBOLS else "—"
         msg = (
             f"🤖 <b>GODBOT IS ONLINE</b>\n"
             f"⏰ {self._now()}\n\n"
-            f"Balance : €{balance:,.2f}\n"
-            f"Symbol  : EURUSD\n"
-            f"Style   : {_escape(style.title())}\n"
-            f"Mode    : {_escape(mode)}\n\n"
+            f"Balance  : {cur}{balance:,.2f}\n"
+            f"Symbols  : {_escape(watchlist_str)}\n"
+            f"Style    : {_escape(style.title())}\n"
+            f"Mode     : {_escape(mode)}\n\n"
             f"Alert Settings:\n"
             f"  Signals  : {'✅' if CONFIG.TELEGRAM_SEND_SIGNALS else '❌'}\n"
             f"  Danger   : {'✅' if CONFIG.TELEGRAM_SEND_DANGER  else '❌'}\n"

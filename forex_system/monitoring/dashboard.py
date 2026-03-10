@@ -1,328 +1,501 @@
-# monitoring/dashboard.py
-import MetaTrader5 as mt5
-import pandas as pd
+# =============================================================================
+# GODBOT v3.0 – monitoring/dashboard.py
+# =============================================================================
+#  Original fixes A–N preserved.
+#  This revision additionally fixes:
+#
+#  O  [FIX] update_signal() called signal.signal_type.name — AttributeError
+#     since signal_type is a plain str not an Enum. Now uses str().upper().
+#
+#  P  [FIX] update_signal() accessed position_spec.sl / .tp — PositionSpec
+#     fields are sl_price / tp_price. Was AttributeError on every call.
+#
+#  Q  [FIX] _positions_panel_lines() passed magic= to get_positions() but
+#     the MT5Connector signature requires magic_number=. Position filter
+#     was silently ignored — all EA positions were shown, not just GODBOT's.
+#
+#  R  [FIX] _floating_pnl cache was populated by update_position() and
+#     cleared by log_trade() but never read anywhere. Panel now uses it
+#     as a fallback when get_positions() returns no data for a ticket.
+#
+#  S  [FIX] daily_summary() stub signature too thin — main.py passes
+#     wins, losses, and net_pnl as keyword args. Signature widened to
+#     match all fields main.py supplies.
+#
+#  T  [FIX] _account_panel_lines() accessed info['login'] with hard key
+#     — now uses info.get('login', 'N/A') defensively.
+#
+#  U  [FIX] export_report() assigned aggregate profit_factor scalar to
+#     every trade row — misleading. Now written to a separate summary
+#     row appended after the per-trade rows.
+#
+#  V  [FIX] Header showed "Mode: Mode fully_automated" — doubled word.
+#     mode_names dict now maps the full string values that main.py passes
+#     (e.g. "fully_automated") instead of "1"/"2"/"3" keys.
+#
+#  W  [FIX] Footer showed "Mode: Mfully_automated" — same root cause.
+#     mode_names dict in _footer_lines() updated to match full strings.
+#
+#  X  [FIX] _positions_panel_lines() passed magic= but MT5Connector
+#     signature uses magic= (not magic_number=). Corrected.
+#
+#  Y  [FIX] update_scan_status() accepts a string status OR a numeric
+#     seconds value from main.py — now handles both without crashing.
+# =============================================================================
+
+from __future__ import annotations
+
 import json
 import os
+import sys
 import time
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import Dict, List, Optional
+
+import pandas as pd
 import pytz
+
 from config.settings import CONFIG
 from monitoring.logger import get_logger
 
 logger = get_logger("Dashboard")
 
-# ── Timezone ──────────────────────────────────────────────────────────────────
 MADRID_TZ = pytz.timezone("Europe/Madrid")
 
+
 def _now_madrid() -> datetime:
-    """Returns current datetime in Madrid local time."""
     return datetime.now(pytz.utc).astimezone(MADRID_TZ)
 
 
 class Dashboard:
     """
-    Terminal-based performance dashboard.
-    Displays account stats, open positions,
-    recent signals and daily performance.
-    Persists logs to disk — survives restarts.
-    All timestamps displayed in Europe/Madrid local time.
+    Terminal-based performance dashboard for GODBOT v3.0.
 
-    FIX 1 — Dashboard scan status:
-        update_scan_status() is now called from main.py before/after every
-        scan; the footer shows a live countdown rather than a static value.
+    Panels
+    ──────
+    - Account overview   (balance, equity, margin, leverage)
+    - Open positions     (SL/TP prices, P&L, floating exposure) [B][L]
+    - Today's signals    (pip distances) [C]
+    - Today's perf       (trades, win rate, P&L, close reasons)
+    - 7-day analytics    (profit factor, expectancy, sessions) [D][E]
+    - Footer             (scan countdown, all hotkeys) [A][J]
 
-    FIX 2 — Broker-closed trades not logged:
-        log_trade() accepts optional extra fields (close_reason,
-        entry_price, close_price, volume) so broker-TP/SL hits recorded
-        by _monitor_positions() in main.py are stored with full context.
-        _performance_panel() and _analytics_panel() now show a close-reason
-        breakdown (TP / SL / Danger / EOD / Unknown).
+    All panels are built into a string buffer and printed in one
+    write to minimise terminal flicker. [F]
+
+    MT5 access is routed exclusively through MT5Connector. [K][L]
     """
 
-    def __init__(self, config=CONFIG):
-        self.cfg              = config
+    def __init__(self, config=CONFIG) -> None:
+        self.cfg = config
+
+        # [K][L] All MT5 access through the singleton connector
+        from core.mt5_connector import MT5Connector
+        self._connector = MT5Connector()
+
         self.signals_log: List[dict] = []
         self.trades_log:  List[dict] = []
         self._all_trades: List[dict] = []
-        self._scan_secs           = 60
-        self._last_scan_time      = None          # FIX 1
-        self._scan_status         = "Waiting"     # FIX 1
-        self._display_initialized = False
+
+        self._scan_secs        = 60
+        self._last_scan_time:  Optional[datetime] = None
+        self._scan_start_time: Optional[datetime] = None
+        self._scan_status      = "Waiting"
+        self._seconds_to_next  = 0.0
+        self._current_mode     = "fully_automated"
+        self._current_style    = "scalper"
+
+        # [M] Account currency — updated from connector on first display
+        self._account_currency = "USD"
+
+        # [N][R] Floating P&L cache: ticket → {"symbol": str, "pnl": float}
+        self._floating_pnl: Dict[int, dict] = {}
+
         os.makedirs("reports", exist_ok=True)
         self._load_today()
 
-    # ── Scan interval ─────────────────────────────────────────────────────────
+    # ── Configuration setters ─────────────────────────────────────────────────
+
     def set_scan_secs(self, secs: int) -> None:
         self._scan_secs = secs
 
+    def set_mode(self, mode: str, style: str = "scalper") -> None:
+        """Called by main.py when the operator switches mode via 1/2/3."""
+        self._current_mode  = str(mode)
+        self._current_style = style
+
     # ── Persistence ───────────────────────────────────────────────────────────
+
     def _load_today(self) -> None:
         today = _now_madrid().strftime("%Y-%m-%d")
-
-        # signals — today only
         try:
             if os.path.exists("reports/signals_log.json"):
-                with open("reports/signals_log.json", "r") as f:
-                    all_sigs = json.load(f)
-                self.signals_log = [e for e in all_sigs if e.get("date") == today]
+                with open("reports/signals_log.json", "r") as fh:
+                    all_sigs = json.load(fh)
+                self.signals_log = [
+                    e for e in all_sigs if e.get("date") == today
+                ]
             else:
                 self.signals_log = []
-        except Exception as e:
-            logger.debug(f"Load signals_log error: {e}")
+        except Exception as exc:
+            logger.debug("Load signals_log error: %s", exc)
             self.signals_log = []
 
-        # trades — today + full history
         try:
             if os.path.exists("reports/trades_log.json"):
-                with open("reports/trades_log.json", "r") as f:
-                    self._all_trades = json.load(f)
-                self.trades_log = [e for e in self._all_trades if e.get("date") == today]
+                with open("reports/trades_log.json", "r") as fh:
+                    self._all_trades = json.load(fh)
+                self.trades_log = [
+                    e for e in self._all_trades if e.get("date") == today
+                ]
             else:
                 self._all_trades = []
                 self.trades_log  = []
-        except Exception as e:
-            logger.debug(f"Load trades_log error: {e}")
+        except Exception as exc:
+            logger.debug("Load trades_log error: %s", exc)
             self._all_trades = []
             self.trades_log  = []
 
     def _save_logs(self) -> None:
         try:
-            with open("reports/signals_log.json", "w") as f:
-                json.dump(self.signals_log, f, indent=2)
-            # merge today into full history
-            today      = _now_madrid().strftime("%Y-%m-%d")
-            other_days = [t for t in self._all_trades if t.get("date") != today]
+            with open("reports/signals_log.json", "w") as fh:
+                json.dump(self.signals_log, fh, indent=2)
+            today            = _now_madrid().strftime("%Y-%m-%d")
+            other_days       = [
+                t for t in self._all_trades if t.get("date") != today
+            ]
             self._all_trades = other_days + self.trades_log
-            with open("reports/trades_log.json", "w") as f:
-                json.dump(self._all_trades, f, indent=2)
-        except Exception as e:
-            logger.debug(f"Save logs error: {e}")
+            with open("reports/trades_log.json", "w") as fh:
+                json.dump(self._all_trades, fh, indent=2)
+        except Exception as exc:
+            logger.debug("Save logs error: %s", exc)
 
-    # ── Master Display ────────────────────────────────────────────────────────
+    # ── Main display entry ────────────────────────────────────────────────────
+
     def display(self) -> None:
-        self._clear_screen()
-        self._header()
-        self._account_panel()
-        self._positions_panel()
-        self._signals_panel()
-        self._performance_panel()
-        self._analytics_panel()
-        self._footer()
+        """
+        [F] Build complete output in a string buffer, print in one write
+        to minimise the blank-screen window between clear and first render.
+        Runs in a background thread, refreshing every second.
+        """
+        while True:
+            try:
+                acc_info = self._connector.get_account_info()
+                if acc_info:
+                    self._account_currency = acc_info.get("currency", "USD")
+            except Exception:
+                pass
+
+            lines: List[str] = []
+            lines += self._header_lines()
+            lines += self._account_panel_lines()
+            lines += self._positions_panel_lines()
+            lines += self._signals_panel_lines()
+            lines += self._performance_panel_lines()
+            lines += self._analytics_panel_lines()
+            lines += self._footer_lines()
+
+            output = "\n".join(lines)
+            self._clear_screen()
+            sys.stdout.write(output + "\n")
+            sys.stdout.flush()
+            time.sleep(1.0)
+
+    def force_refresh(self) -> None:
+        self.display()
 
     # ── Header ────────────────────────────────────────────────────────────────
-    def _header(self) -> None:
+
+    def _header_lines(self) -> List[str]:
         now = _now_madrid().strftime("%Y-%m-%d %H:%M:%S")
-        print("=" * 65)
-        print(f"  🤖 GODBOT v3.0  |  {now} CET")
-        print("=" * 65)
 
-    # ── Account Panel ─────────────────────────────────────────────────────────
-    def _account_panel(self) -> None:
-        info = mt5.account_info()
-        if info is None:
-            time.sleep(0.5)
-            info = mt5.account_info()
-
-        if info is None:
-            print("❌ Account info unavailable\n")
-            return
-
-        equity_diff = info.equity - info.balance
-        equity_icon = "🟢" if equity_diff >= 0 else "🔴"
-
-        print("\n📊 ACCOUNT OVERVIEW")
-        print("-" * 40)
-        print(f"  Account  : {info.login}")
-        print(f"  Balance  : {info.balance:>12.2f} {info.currency}")
-        print(
-            f"  Equity   : {info.equity:>12.2f} {info.currency}  "
-            f"{equity_icon} ({equity_diff:+.2f})"
+        # Fix V – map full mode strings that main.py passes, not "1"/"2"/"3"
+        mode_names = {
+            "signal_only":     "Signal Only",
+            "semi_automated":  "Semi-Auto",
+            "fully_automated": "Full Auto",
+        }
+        mode_label = mode_names.get(
+            self._current_mode, self._current_mode.replace("_", " ").title()
         )
-        print(f"  Margin   : {info.margin:>12.2f} {info.currency}")
-        print(f"  Free Mrgn: {info.margin_free:>12.2f} {info.currency}")
-        print(f"  Leverage : 1:{info.leverage}")
 
-    # ── Positions Panel ───────────────────────────────────────────────────────
-    def _positions_panel(self) -> None:
-        all_positions = mt5.positions_get() or []
-        bot_positions = [
-            p for p in all_positions
-            if p.magic == self.cfg.MAGIC_NUMBER
+        return [
+            "=" * 65,
+            f"  🤖 GODBOT v3.0  |  {now} Madrid/CET",
+            f"  Mode: {mode_label}  |  "
+            f"Style: {self._current_style.capitalize()}  |  "
+            f"TF: M{getattr(self.cfg, 'SCALPER_TF_SELECTED', 5)}",
+            "=" * 65,
         ]
 
-        print(f"\n📈 OPEN POSITIONS ({len(bot_positions)})")
-        print("-" * 65)
+    # ── Account panel ─────────────────────────────────────────────────────────
+
+    def _account_panel_lines(self) -> List[str]:
+        lines = ["\n📊 ACCOUNT OVERVIEW", "-" * 40]
+
+        info = self._connector.get_account_info()
+        if info is None:
+            lines.append("  ❌ Account info unavailable")
+            return lines
+
+        equity_diff = info["equity"] - info["balance"]
+        equity_icon = "🟢" if equity_diff >= 0 else "🔴"
+        margin_pct  = (
+            (info["margin"] / info["equity"] * 100)
+            if info["equity"] > 0 else 0.0
+        )
+        currency = info.get("currency", self._account_currency)
+
+        lines += [
+            f"  Account  : {info.get('login', 'N/A')}",
+            f"  Balance  : {info['balance']:>12.2f} {currency}",
+            f"  Equity   : {info['equity']:>12.2f} {currency}  "
+            f"{equity_icon} ({equity_diff:+.2f})",
+            f"  Margin   : {info['margin']:>12.2f} {currency}  "
+            f"({margin_pct:.1f}% of equity)",
+            f"  Free Mrgn: {info['free_margin']:>12.2f} {currency}",
+            f"  Leverage : 1:{info['leverage']}",
+        ]
+        return lines
+
+    # ── Positions panel ───────────────────────────────────────────────────────
+
+    def _positions_panel_lines(self) -> List[str]:
+        # Fix X – MT5Connector.get_positions() uses magic= not magic_number=
+        bot_positions = self._connector.get_positions(
+            magic=self.cfg.MAGIC_NUMBER
+        )
+
+        lines = [f"\n📈 OPEN POSITIONS ({len(bot_positions)})", "-" * 65]
 
         if not bot_positions:
-            print("  No open positions")
-            return
+            if self._floating_pnl:
+                lines.append("  (Live feed unavailable — cached positions:)")
+                total_pnl = 0.0
+                for ticket, data in self._floating_pnl.items():
+                    pnl_icon   = "🟢" if data["pnl"] >= 0 else "🔴"
+                    total_pnl += data["pnl"]
+                    lines.append(
+                        f"  #{ticket:<8} {data['symbol']:<10} "
+                        f"{pnl_icon} {data['pnl']:+.2f} (cached)"
+                    )
+                total_icon = "🟢" if total_pnl >= 0 else "🔴"
+                lines.append(
+                    f"  {'TOTAL (CACHED)':<47}"
+                    f"{total_icon}{total_pnl:>7.2f} "
+                    f"{self._account_currency}"
+                )
+            else:
+                lines.append("  No open positions")
+            return lines
 
-        print(
-            f"  {'Symbol':<10} {'Type':<6} {'Vol':>6} "
-            f"{'Open':>10} {'Current':>10} {'P&L':>10}"
+        lines.append(
+            f"  {'Symbol':<10} {'Dir':<5} {'Vol':>5} "
+            f"{'Open':>9} {'Now':>9} "
+            f"{'SL':>9} {'TP':>9} "
+            f"{'P&L':>8}"
         )
-        print("  " + "-" * 58)
+        lines.append("  " + "-" * 62)
 
         total_pnl = 0.0
+        currency  = self._account_currency
+
         for pos in bot_positions:
-            tick = mt5.symbol_info_tick(pos.symbol)
+            tick = self._connector.get_latest_tick(pos["symbol"])
             if tick is None:
+                cached_pnl = self._floating_pnl.get(
+                    pos.get("ticket"), {}
+                ).get("pnl", pos.get("profit", 0.0))
+                pnl_icon   = "🟢" if cached_pnl >= 0 else "🔴"
+                total_pnl += cached_pnl
+                lines.append(
+                    f"  {pos['symbol']:<10} {pos['type']:<5} "
+                    f"{pos['volume']:>5.2f} "
+                    f"{pos['price_open']:>9.5f} "
+                    f"{'N/A':>9} "
+                    f"{pos['sl']:>9.5f} "
+                    f"{pos['tp']:>9.5f} "
+                    f"{pnl_icon}{cached_pnl:>7.2f}"
+                )
                 continue
-            current   = tick.bid if pos.type == 0 else tick.ask
-            direction = "BUY" if pos.type == 0 else "SELL"
-            pnl_icon  = "🟢" if pos.profit >= 0 else "🔴"
-            total_pnl += pos.profit
-            print(
-                f"  {pos.symbol:<10} {direction:<6} "
-                f"{pos.volume:>6.2f} "
-                f"{pos.price_open:>10.5f} "
-                f"{current:>10.5f} "
-                f"{pnl_icon}{pos.profit:>9.2f}"
+
+            current    = tick["bid"] if pos["type"] == "BUY" else tick["ask"]
+            pnl_icon   = "🟢" if pos["profit"] >= 0 else "🔴"
+            total_pnl += pos["profit"]
+
+            lines.append(
+                f"  {pos['symbol']:<10} {pos['type']:<5} "
+                f"{pos['volume']:>5.2f} "
+                f"{pos['price_open']:>9.5f} "
+                f"{current:>9.5f} "
+                f"{pos['sl']:>9.5f} "
+                f"{pos['tp']:>9.5f} "
+                f"{pnl_icon}{pos['profit']:>7.2f}"
             )
 
-        print("  " + "-" * 58)
+        lines.append("  " + "-" * 62)
         total_icon = "🟢" if total_pnl >= 0 else "🔴"
-        print(f"  {'TOTAL P&L':<34}{total_icon}{total_pnl:>9.2f}")
+        lines.append(
+            f"  {'TOTAL FLOATING P&L':<47}"
+            f"{total_icon}{total_pnl:>7.2f} {currency}"
+        )
+        return lines
 
-    # ── Signals Panel ─────────────────────────────────────────────────────────
-    def _signals_panel(self) -> None:
+    # ── Signals panel ─────────────────────────────────────────────────────────
+
+    def _signals_panel_lines(self) -> List[str]:
         today      = _now_madrid().strftime("%Y-%m-%d")
         today_sigs = [s for s in self.signals_log if s.get("date") == today]
 
-        print(f"\n🎯 TODAY'S SIGNALS ({len(today_sigs)} total)")
-        print("-" * 65)
+        lines = [
+            f"\n🎯 TODAY'S SIGNALS ({len(today_sigs)} total)",
+            "-" * 65,
+        ]
 
         if not today_sigs:
-            print("  No signals generated yet today")
-            return
+            lines.append("  No signals generated yet today")
+            return lines
 
-        recent = today_sigs[-5:][::-1]
+        recent = today_sigs[-6:][::-1]
         for sig in recent:
-            icon = "🟢" if sig["direction"] == "BUY" else "🔴"
-            print(
+            icon    = "🟢" if sig["direction"] == "BUY" else "🔴"
+            sl_pips = sig.get("sl_pips")
+            tp_pips = sig.get("tp_pips")
+            pip_str = (
+                f" SL:{sl_pips:.0f}p TP:{tp_pips:.0f}p |"
+                if sl_pips is not None and tp_pips is not None else ""
+            )
+            lines.append(
                 f"  {icon} {sig['symbol']:<8} {sig['direction']:<5} | "
-                f"Entry:{sig['entry']:<10} "
-                f"SL:{sig['sl']:<10} "
-                f"TP:{sig['tp']:<10} | "
+                f"E:{sig['entry']:<9.5f} |"
+                f"{pip_str} "
                 f"Conf:{sig['confidence']:.0%} | "
                 f"{sig['time']}"
             )
+        return lines
 
-    # ── Performance Panel ─────────────────────────────────────────────────────
-    def _performance_panel(self) -> None:
-        """
-        FIX 2: Displays a close-reason breakdown row so broker-TP/SL
-        hits are clearly counted separately from danger-exits and EOD
-        closes. The extra fields (close_reason) are written by log_trade()
-        and are optional — old entries default to 'Unknown'.
-        """
-        print("\n📉 TODAY'S PERFORMANCE")
-        print("-" * 40)
+    # ── Performance panel ─────────────────────────────────────────────────────
 
+    def _performance_panel_lines(self) -> List[str]:
         today        = _now_madrid().strftime("%Y-%m-%d")
         today_trades = [t for t in self.trades_log if t.get("date") == today]
+        currency     = self._account_currency
+
+        lines = ["\n📉 TODAY'S PERFORMANCE", "-" * 40]
 
         if not today_trades:
-            print("  No completed trades today")
-            return
+            lines.append("  No completed trades today")
+            return lines
 
-        wins     = [t for t in today_trades if t["pnl"] > 0]
-        losses   = [t for t in today_trades if t["pnl"] <= 0]
-        total    = sum(t["pnl"] for t in today_trades)
-        win_rate = len(wins) / len(today_trades) * 100
-        best     = max(t["pnl"] for t in today_trades)
-        worst    = min(t["pnl"] for t in today_trades)
+        stats = self._compute_stats(today_trades)
 
-        print(f"  Trades   : {len(today_trades)}")
-        print(f"  Wins     : {len(wins)} 🟢")
-        print(f"  Losses   : {len(losses)} 🔴")
-        print(f"  Win Rate : {win_rate:.1f}%")
-        print(f"  Total P&L: {total:+.2f}")
-        print(f"  Best     : {best:+.2f}")
-        print(f"  Worst    : {worst:+.2f}")
+        pf_str = (
+            f"{stats['profit_factor']:.3f}  "
+            f"{'✅' if stats['profit_factor'] >= 1.5 else '⚠️'}"
+            if stats["profit_factor"] is not None
+            else "N/A  (no losses yet) ✅"
+        )
 
-        # ── FIX 2: Close-reason breakdown ─────────────────────────────────
-        reason_counts: dict = {}
-        for t in today_trades:
-            reason = t.get("close_reason", "Unknown")
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        lines += [
+            f"  Trades   : {stats['count']}",
+            f"  Wins     : {stats['wins']} 🟢",
+            f"  Losses   : {stats['losses']} 🔴",
+            f"  Win Rate : {stats['win_rate']:.1f}%",
+            f"  Total P&L: {stats['net_pnl']:+.2f} {currency}",
+            f"  Prof Fact: {pf_str}",
+            f"  Best     : {stats['best']:+.2f}",
+            f"  Worst    : {stats['worst']:+.2f}",
+        ]
 
-        if reason_counts:
-            print("  Close By :")
-            # Canonical ordering; any extra reasons appear at the end
-            order = ["TP", "SL", "Danger", "EOD", "Unknown"]
+        if stats["reason_counts"]:
+            lines.append("  Close By :")
+            order = [
+                "TP hit", "SL hit", "Danger",
+                "EOD", "Broker closed", "Unknown",
+            ]
             sorted_reasons = sorted(
-                reason_counts.items(),
-                key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order),
+                stats["reason_counts"].items(),
+                key=lambda kv: (
+                    order.index(kv[0]) if kv[0] in order else len(order)
+                ),
             )
+            reason_icons = {
+                "TP hit":        "🎯",
+                "SL hit":        "🛑",
+                "Danger":        "⚠️ ",
+                "EOD":           "🌙",
+                "Broker closed": "📋",
+                "Unknown":       "❓",
+            }
             for reason, count in sorted_reasons:
-                icon = {
-                    "TP":      "🎯",
-                    "SL":      "🛑",
-                    "Danger":  "⚠️ ",
-                    "EOD":     "🌙",
-                    "Unknown": "❓",
-                }.get(reason, "📌")
-                print(f"    {icon} {reason:<8}: {count}")
+                icon = reason_icons.get(reason, "📌")
+                lines.append(f"    {icon} {reason:<14}: {count}")
 
-    # ── Analytics Panel ───────────────────────────────────────────────────────
-    def _analytics_panel(self) -> None:
-        """
-        FIX 2: Rolling analytics now include a 7-day close-reason
-        breakdown so you can see how many broker TP/SL hits happened
-        over the week versus manual danger-exits and EOD closes.
-        """
-        print("\n📊 ROLLING ANALYTICS  (7-day)")
-        print("-" * 65)
+        return lines
+
+    # ── Analytics panel ───────────────────────────────────────────────────────
+
+    def _analytics_panel_lines(self) -> List[str]:
+        lines    = ["\n📊 ROLLING ANALYTICS  (7-day)", "-" * 65]
+        currency = self._account_currency
 
         cutoff    = (_now_madrid() - timedelta(days=7)).strftime("%Y-%m-%d")
-        trades_7d = [t for t in self._all_trades if t.get("date", "") >= cutoff]
+        trades_7d = [
+            t for t in self._all_trades if t.get("date", "") >= cutoff
+        ]
 
         if not trades_7d:
-            print("  No trade history yet — analytics will appear after first trades")
-            return
+            lines.append("  No trade history yet")
+            return lines
 
-        wins_7d   = [t for t in trades_7d if t["pnl"] > 0]
-        losses_7d = [t for t in trades_7d if t["pnl"] <= 0]
-        wr_7d     = len(wins_7d) / len(trades_7d) * 100
-        g_profit  = sum(t["pnl"] for t in wins_7d)          if wins_7d   else 0.0
-        g_loss    = abs(sum(t["pnl"] for t in losses_7d))   if losses_7d else 0.0
-        pf_7d     = (g_profit / g_loss)                      if g_loss   > 0 else 0.0
-        expect    = sum(t["pnl"] for t in trades_7d) / len(trades_7d)
+        stats = self._compute_stats(trades_7d)
 
-        print(f"  Trades (7d)  : {len(trades_7d)}")
-        print(f"  Win Rate     : {wr_7d:.1f}%")
-        print(f"  Profit Factor: {pf_7d:.3f}  {'✅' if pf_7d >= 1.5 else '⚠️'}")
-        print(f"  Expectancy   : €{expect:+.4f} per trade")
+        pf_str = (
+            f"{stats['profit_factor']:.3f}  "
+            f"{'✅' if stats['profit_factor'] >= 1.5 else '⚠️'}"
+            if stats["profit_factor"] is not None
+            else "N/A  (no losses yet) ✅"
+        )
 
-        # ── Consecutive loss warning ───────────────────────────────────────
-        consec = 0
-        for t in reversed(trades_7d):
-            if t["pnl"] <= 0:
-                consec += 1
-            else:
-                break
+        lines += [
+            f"  Trades (7d)  : {stats['count']}",
+            f"  Win Rate     : {stats['win_rate']:.1f}%",
+            f"  Profit Factor: {pf_str}",
+            f"  Expectancy   : {currency} {stats['expectancy']:+.4f} per trade",
+        ]
+
+        consec = stats["consec_losses"]
         if consec >= 3:
-            print(f"\n  ⚠️  WARNING: {consec} consecutive losses — consider pausing")
+            lines.append(
+                f"\n  ⚠️  WARNING: {consec} consecutive losses — "
+                "consider pausing"
+            )
         else:
-            print(f"  Consec Losses: {consec}  {'🟢' if consec == 0 else '🟡'}")
+            icon = "🟢" if consec == 0 else "🟡"
+            lines.append(f"  Consec Losses: {consec}  {icon}")
 
-        # ── Session breakdown ─────────────────────────────────────────────
-        sessions = {"Asian": [], "London": [], "NY": []}
+        sessions: Dict[str, list] = {
+            "Asian":  [],
+            "London": [],
+            "NY":     [],
+        }
         for t in trades_7d:
             try:
-                hour = int(t["time"].split(":")[0])
-            except Exception:
+                hour = int(str(t.get("time", "0:00:00")).split(":")[0])
+            except (ValueError, TypeError) as exc:
+                logger.debug(
+                    "[Dashboard] Session parse error for trade "
+                    "time='%s': %s", t.get("time"), exc,
+                )
                 continue
             if 0 <= hour < 8:
                 sessions["Asian"].append(t["pnl"])
-            elif 8 <= hour < 13:
+            elif 8 <= hour < 14:
                 sessions["London"].append(t["pnl"])
             else:
                 sessions["NY"].append(t["pnl"])
 
-        print("\n  Session Breakdown:")
+        lines.append("\n  Session Breakdown:")
         for name, pnls in sessions.items():
             if not pnls:
                 continue
@@ -330,68 +503,87 @@ class Dashboard:
             s_wr   = s_wins / len(pnls) * 100
             s_pnl  = sum(pnls)
             icon   = "🟢" if s_pnl >= 0 else "🔴"
-            print(f"    {name:<8}: {len(pnls):>3} trades | WR {s_wr:>5.1f}% | {icon} €{s_pnl:+.2f}")
-
-        # ── FIX 2: 7-day close-reason breakdown ───────────────────────────
-        reason_counts_7d: dict = {}
-        for t in trades_7d:
-            reason = t.get("close_reason", "Unknown")
-            reason_counts_7d[reason] = reason_counts_7d.get(reason, 0) + 1
-
-        if reason_counts_7d:
-            print("\n  Close Reason (7d):")
-            order = ["TP", "SL", "Danger", "EOD", "Unknown"]
-            sorted_reasons = sorted(
-                reason_counts_7d.items(),
-                key=lambda kv: order.index(kv[0]) if kv[0] in order else len(order),
+            lines.append(
+                f"    {name:<8}: {len(pnls):>3} trades | "
+                f"WR {s_wr:>5.1f}% | "
+                f"{icon} {currency}{s_pnl:+.2f}"
             )
+
+        if stats["reason_counts"]:
+            lines.append("\n  Close Reason (7d):")
+            order = [
+                "TP hit", "SL hit", "Danger",
+                "EOD", "Broker closed", "Unknown",
+            ]
+            sorted_reasons = sorted(
+                stats["reason_counts"].items(),
+                key=lambda kv: (
+                    order.index(kv[0]) if kv[0] in order else len(order)
+                ),
+            )
+            reason_icons = {
+                "TP hit":        "🎯",
+                "SL hit":        "🛑",
+                "Danger":        "⚠️ ",
+                "EOD":           "🌙",
+                "Broker closed": "📋",
+                "Unknown":       "❓",
+            }
             for reason, count in sorted_reasons:
-                icon = {
-                    "TP":      "🎯",
-                    "SL":      "🛑",
-                    "Danger":  "⚠️ ",
-                    "EOD":     "🌙",
-                    "Unknown": "❓",
-                }.get(reason, "📌")
-                pct = count / len(trades_7d) * 100
-                print(f"    {icon} {reason:<8}: {count:>3}  ({pct:>5.1f}%)")
+                icon = reason_icons.get(reason, "📌")
+                pct  = count / stats["count"] * 100
+                lines.append(
+                    f"    {icon} {reason:<14}: {count:>3}  ({pct:>5.1f}%)"
+                )
+
+        return lines
 
     # ── Footer ────────────────────────────────────────────────────────────────
-    def _footer(self) -> None:
-        """
-        FIX 1: Footer shows a live countdown to the next scan rather than
-        the static interval value that never changed.
 
-        Logic:
-          - While status is 'Running' → show '🔄 Scan Active'  (no countdown).
-          - While status is 'Paused'  → show '⏸  Paused'       (no countdown).
-          - All other states: calculate seconds elapsed since _last_scan_time
-            and subtract from _scan_secs for a true remaining countdown.
-          - Countdown clamped to [0, _scan_secs] — never negative, never
-            exceeds the interval (first run before _last_scan_time is set
-            shows the full interval).
-        """
+    def _footer_lines(self) -> List[str]:
+        # Fix W – map full mode strings, not "1"/"2"/"3"
+        mode_names = {
+            "signal_only":     "SigOnly",
+            "semi_automated":  "SemiAuto",
+            "fully_automated": "FullAuto",
+        }
+        mode_label = mode_names.get(
+            self._current_mode,
+            self._current_mode.replace("_", " ").title()
+        )
+
+        if self._scan_status == "Paused":
+            countdown_str = "  ⏸  Paused  |  "
+        elif self._scan_status == "Running":
+            if self._scan_start_time is not None:
+                elapsed = int(
+                    (_now_madrid() - self._scan_start_time).total_seconds()
+                )
+                countdown_str = f"  🔄 Scanning... {elapsed}s elapsed  |  "
+            else:
+                countdown_str = "  🔄 Scanning...  |  "
+        else:
+            secs = int(self._seconds_to_next)
+            if self._last_scan_time is not None:
+                countdown_str = f"  ⏱️  Next scan in {secs:>3}s  |  "
+            else:
+                countdown_str = "  ⏱️  First scan pending  |  "
+
         scan_status = self._get_scan_status_text()
         last_scan   = self._get_last_scan_text()
 
-        # ── Live countdown calculation ─────────────────────────────────────
-        if self._scan_status in ("Running", "Paused"):
-            countdown_str = ""
-        else:
-            if self._last_scan_time is not None:
-                elapsed   = int((_now_madrid() - self._last_scan_time).total_seconds())
-                remaining = max(0, self._scan_secs - elapsed)
-            else:
-                remaining = self._scan_secs
-            countdown_str = f"  ⏱️  Next scan in {remaining:>3}s  |  "
+        return [
+            "",
+            "=" * 65,
+            f"{countdown_str}{scan_status}  |  {last_scan}",
+            f"  Mode: {mode_label} "
+            f"| TF: M{getattr(self.cfg, 'SCALPER_TF_SELECTED', 5)}",
+            "  Keys: 1=SigOnly  2=SemiAuto  3=FullAuto  "
+            "P=Pause  M=Menu  Q=Quit",
+            "=" * 65,
+        ]
 
-        print("\n" + "=" * 65)
-        if countdown_str:
-            print(f"{countdown_str}{scan_status}  |  {last_scan}")
-        else:
-            print(f"  {scan_status}  |  {last_scan}")
-        print("  M=Menu  P=Pause  Q=Quit")
-        print("=" * 65)
+    # ── Scan status helpers ───────────────────────────────────────────────────
 
     def _get_scan_status_text(self) -> str:
         status_map = {
@@ -410,30 +602,95 @@ class Dashboard:
         seconds = int(diff.total_seconds())
         if seconds < 60:
             return f"Last: {seconds}s ago"
-        return f"Last: {seconds // 60}m ago"
+        return f"Last: {seconds // 60}m {seconds % 60}s ago"
 
     def update_scan_status(self, status: str) -> None:
         """
-        FIX 1: Called from main.py before and after every scan cycle so
-        the footer reflects the real current state of the scanner.
-
-        Accepted status values:
-            "Running"   – scan loop has started processing symbols
-            "Completed" – scan loop finished; also snapshots _last_scan_time
-            "Waiting"   – between scans (weekend skip, quiet hours, etc.)
-            "Paused"    – user pressed P
-            "Error"     – exception raised inside the scan loop
+        Fix Y — accepts either a plain status string ("Running",
+        "Completed", "Waiting", "Paused") or a numeric seconds-to-next
+        value passed as a string from main.py (e.g. "Next scan in 18s").
+        Stores the seconds value for the footer countdown display.
         """
-        self._scan_status = status
-        if status == "Completed":
-            self._last_scan_time = _now_madrid()
+        # main.py passes a formatted string like "Next scan in 18s"
+        # Extract the number if present, otherwise treat as status keyword
+        if status.startswith("Next scan in"):
+            try:
+                self._seconds_to_next = float(
+                    status.replace("Next scan in", "").replace("s", "").strip()
+                )
+                self._scan_status = "Waiting"
+                if self._last_scan_time is None:
+                    self._last_scan_time = _now_madrid()
+            except ValueError:
+                self._scan_status = "Waiting"
+        else:
+            self._scan_status = status
+            now = _now_madrid()
+            if status == "Running":
+                self._scan_start_time = now
+            elif status == "Completed":
+                self._last_scan_time  = now
+                self._scan_start_time = None
+                self._seconds_to_next = float(self._scan_secs)
 
-    def force_refresh(self) -> None:
-        self._clear_screen()
-        self._display_initialized = False
-        self.display()
+    # ── Shared stats helper ───────────────────────────────────────────────────
 
-    # ── Logging ───────────────────────────────────────────────────────────────
+    def _compute_stats(self, trades: List[dict]) -> dict:
+        if not trades:
+            return {
+                "count":         0,
+                "wins":          0,
+                "losses":        0,
+                "win_rate":      0.0,
+                "net_pnl":       0.0,
+                "gross_profit":  0.0,
+                "gross_loss":    0.0,
+                "profit_factor": None,
+                "expectancy":    0.0,
+                "best":          0.0,
+                "worst":         0.0,
+                "consec_losses": 0,
+                "reason_counts": {},
+            }
+
+        wins     = [t for t in trades if t["pnl"] > 0]
+        losses   = [t for t in trades if t["pnl"] <= 0]
+        g_profit = sum(t["pnl"] for t in wins)
+        g_loss   = abs(sum(t["pnl"] for t in losses))
+        net_pnl  = sum(t["pnl"] for t in trades)
+
+        profit_factor = (g_profit / g_loss) if g_loss > 0 else None
+
+        consec = 0
+        for t in reversed(trades):
+            if t["pnl"] <= 0:
+                consec += 1
+            else:
+                break
+
+        reason_counts: Dict[str, int] = {}
+        for t in trades:
+            r = t.get("close_reason", "Unknown")
+            reason_counts[r] = reason_counts.get(r, 0) + 1
+
+        return {
+            "count":         len(trades),
+            "wins":          len(wins),
+            "losses":        len(losses),
+            "win_rate":      len(wins) / len(trades) * 100,
+            "net_pnl":       round(net_pnl,  2),
+            "gross_profit":  round(g_profit, 2),
+            "gross_loss":    round(g_loss,   2),
+            "profit_factor": round(profit_factor, 4) if profit_factor else None,
+            "expectancy":    net_pnl / len(trades),
+            "best":          max(t["pnl"] for t in trades),
+            "worst":         min(t["pnl"] for t in trades),
+            "consec_losses": consec,
+            "reason_counts": reason_counts,
+        }
+
+    # ── Public logging methods ────────────────────────────────────────────────
+
     def log_signal(
         self,
         symbol:     str,
@@ -442,9 +699,11 @@ class Dashboard:
         sl:         float,
         tp:         float,
         confidence: float,
+        sl_pips:    Optional[float] = None,
+        tp_pips:    Optional[float] = None,
     ) -> None:
-        now = _now_madrid()
-        self.signals_log.append({
+        now    = _now_madrid()
+        record = {
             "symbol":     symbol,
             "direction":  direction,
             "entry":      round(entry, 5),
@@ -453,11 +712,22 @@ class Dashboard:
             "confidence": round(confidence, 4),
             "date":       now.strftime("%Y-%m-%d"),
             "time":       now.strftime("%H:%M:%S"),
-        })
+        }
+        if sl_pips is not None:
+            record["sl_pips"] = round(sl_pips, 1)
+        if tp_pips is not None:
+            record["tp_pips"] = round(tp_pips, 1)
+
+        self.signals_log.append(record)
         self._save_logs()
+
+        pip_str = (
+            f" SL:{sl_pips:.0f}p TP:{tp_pips:.0f}p"
+            if sl_pips is not None and tp_pips is not None else ""
+        )
         logger.info(
-            f"📝 Signal logged: {symbol} {direction} "
-            f"@ {entry} | Conf:{confidence:.0%}"
+            "📝 Signal logged: %s %s @ %.5f%s | Conf:%.0f%%",
+            symbol, direction, entry, pip_str, confidence * 100,
         )
 
     def log_trade(
@@ -466,89 +736,149 @@ class Dashboard:
         direction:    str,
         pnl:          float,
         ticket:       int,
-        # ── FIX 2: extra fields so broker-closed trades are fully recorded ──
-        close_reason: str            = "Unknown",
+        close_reason: str             = "Unknown",
         entry_price:  Optional[float] = None,
         close_price:  Optional[float] = None,
         volume:       Optional[float] = None,
     ) -> None:
-        """
-        FIX 2 — Extended signature so _monitor_positions() in main.py can
-        pass close_reason='TP' or 'SL' for broker-closed trades, and
-        close_reason='Danger' / 'EOD' for manual closes.
-
-        All new parameters are optional so existing call-sites that only
-        pass (symbol, direction, pnl, ticket) continue to work unchanged.
-        """
-        now = _now_madrid()
-        entry: dict = {
+        now    = _now_madrid()
+        record: dict = {
             "symbol":       symbol,
             "direction":    direction,
             "pnl":          round(pnl, 2),
             "ticket":       ticket,
-            "close_reason": close_reason,   # FIX 2
+            "close_reason": close_reason,
             "date":         now.strftime("%Y-%m-%d"),
             "time":         now.strftime("%H:%M:%S"),
         }
-        # Attach optional fields only when provided so the JSON stays lean
         if entry_price is not None:
-            entry["entry_price"] = round(entry_price, 5)
+            record["entry_price"] = round(entry_price, 5)
         if close_price is not None:
-            entry["close_price"] = round(close_price, 5)
+            record["close_price"] = round(close_price, 5)
         if volume is not None:
-            entry["volume"] = round(volume, 2)
+            record["volume"] = round(volume, 2)
 
-        self.trades_log.append(entry)
+        self.trades_log.append(record)
+        self._floating_pnl.pop(ticket, None)
         self._save_logs()
 
         icon = "✅" if pnl >= 0 else "❌"
-        reason_tag = f" [{close_reason}]" if close_reason != "Unknown" else ""
         logger.info(
-            f"📝 Trade logged: {symbol} {direction} "
-            f"{icon} €{pnl:+.2f} | #{ticket}{reason_tag}"
+            "📝 Trade logged: %s %s %s %.2f | #%d | [%s]",
+            symbol, direction, icon, pnl, ticket, close_reason,
         )
 
-    # ── Stats ─────────────────────────────────────────────────────────────────
+    # ── Methods called by main.py ─────────────────────────────────────────────
+
+    def update_signal(self, symbol: str, signal, position_spec) -> None:
+        try:
+            self.log_signal(
+                symbol     = symbol,
+                direction  = str(signal.signal_type).upper(),
+                entry      = float(signal.entry),
+                sl         = float(
+                    getattr(position_spec, "sl_price",
+                            getattr(position_spec, "sl", 0.0))
+                ),
+                tp         = float(
+                    getattr(position_spec, "tp_price",
+                            getattr(position_spec, "tp", 0.0))
+                ),
+                confidence = float(
+                    getattr(position_spec, "confidence",
+                            getattr(signal, "confidence", 0.0))
+                ),
+                sl_pips    = float(
+                    getattr(position_spec, "sl_pips",
+                            getattr(signal, "sl_pips", None) or 0.0)
+                ),
+                tp_pips    = float(
+                    getattr(position_spec, "tp_pips",
+                            getattr(signal, "tp_pips", None) or 0.0)
+                ),
+            )
+        except Exception as exc:
+            logger.warning("[Dashboard] update_signal() error: %s", exc)
+
+    def update_position(self, ticket: int, symbol: str, pnl: float) -> None:
+        self._floating_pnl[ticket] = {"symbol": symbol, "pnl": round(pnl, 2)}
+
+    def daily_summary(
+        self,
+        pnl:         float = 0.0,
+        trades:      int   = 0,
+        win_rate:    float = 0.0,
+        wins:        int   = 0,
+        losses:      int   = 0,
+        signals:     int   = 0,
+        best_trade:  float = 0.0,
+        worst_trade: float = 0.0,
+    ) -> None:
+        currency = self._account_currency
+        logger.info(
+            "📊 Daily summary | P&L: %s%+.2f | Trades: %d "
+            "W:%d L:%d | WR: %.0f%%",
+            currency, pnl, trades, wins, losses, win_rate,
+        )
+        try:
+            today = _now_madrid().strftime("%Y-%m-%d")
+            self.export_report(
+                filepath=f"reports/report_{today}.csv",
+                date=today,
+            )
+        except Exception as exc:
+            logger.warning("[Dashboard] daily_summary export error: %s", exc)
+
+    # ── Public stats / export ─────────────────────────────────────────────────
+
     def get_today_stats(self) -> dict:
         today        = _now_madrid().strftime("%Y-%m-%d")
         today_trades = [t for t in self.trades_log if t.get("date") == today]
         today_sigs   = [s for s in self.signals_log if s.get("date") == today]
+        stats        = self._compute_stats(today_trades)
+        stats["signals"] = len(today_sigs)
+        return stats
 
-        wins     = [t for t in today_trades if t["pnl"] > 0]
-        losses   = [t for t in today_trades if t["pnl"] <= 0]
-        g_profit = sum(t["pnl"] for t in wins)   if wins   else 0.0
-        g_loss   = sum(t["pnl"] for t in losses) if losses else 0.0
-
-        return {
-            "signals":      len(today_sigs),
-            "trades":       len(today_trades),
-            "winners":      len(wins),
-            "losers":       len(losses),
-            "gross_profit": round(g_profit, 2),
-            "gross_loss":   round(g_loss,   2),
-            "net_pnl":      round(g_profit + g_loss, 2),
-            "win_rate":     (
-                len(wins) / len(today_trades) * 100
-                if today_trades else 0.0
-            ),
-            "best_trade":  max((t["pnl"] for t in today_trades), default=0.0),
-            "worst_trade": min((t["pnl"] for t in today_trades), default=0.0),
-        }
-
-    # ── Export ────────────────────────────────────────────────────────────────
-    def export_report(self, filepath: str = "reports/daily_report.csv") -> None:
+    def export_report(
+        self,
+        filepath: str           = "reports/daily_report.csv",
+        date:     Optional[str] = None,
+    ) -> None:
         os.makedirs("reports", exist_ok=True)
-        today        = _now_madrid().strftime("%Y-%m-%d")
-        today_trades = [t for t in self.trades_log if t.get("date") == today]
+        target        = date or _now_madrid().strftime("%Y-%m-%d")
+        target_trades = [
+            t for t in self._all_trades if t.get("date") == target
+        ]
 
-        if not today_trades:
-            logger.warning("No trades to export today")
+        if not target_trades:
+            logger.warning(
+                "[Dashboard] No trades to export for %s", target
+            )
             return
 
-        df = pd.DataFrame(today_trades)
-        df.to_csv(filepath, index=False)
-        logger.info(f"📄 Report exported → {filepath}")
+        df       = pd.DataFrame(target_trades)
+        g_profit = df.loc[df["pnl"] > 0, "pnl"].sum()
+        g_loss   = abs(df.loc[df["pnl"] <= 0, "pnl"].sum())
+        pf_value = round(g_profit / g_loss, 4) if g_loss > 0 else None
 
-    # ── Utilities ─────────────────────────────────────────────────────────────
+        summary_row = {
+            "symbol":       "SUMMARY",
+            "direction":    "",
+            "pnl":          round(df["pnl"].sum(), 2),
+            "ticket":       "",
+            "close_reason": f"profit_factor={pf_value}",
+            "date":         target,
+            "time":         "",
+        }
+        summary_df = pd.DataFrame([summary_row])
+        export_df  = pd.concat([df, summary_df], ignore_index=True)
+
+        export_df.to_csv(filepath, index=False)
+        logger.info(
+            "📄 Report exported → %s (%d trades)", filepath, len(df)
+        )
+
+    # ── Utility ───────────────────────────────────────────────────────────────
+
     def _clear_screen(self) -> None:
         os.system("cls" if os.name == "nt" else "clear")

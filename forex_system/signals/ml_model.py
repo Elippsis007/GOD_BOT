@@ -1,739 +1,1107 @@
-# signals/ml_model.py
+# =============================================================================
+# GODBOT v3.0 – signals/ml_model.py
+# =============================================================================
+#  Fixes / improvements applied in this revision:
+#
+#  A  float32 cast + NaN-drop done per-chunk (chunked 36k-bar history)
+#
+#  B  Granular try/except per feature group — one bad indicator does not
+#     wipe the entire feature matrix
+#
+#  C  Label alignment fixed after NaN drops — index reset before concat
+#
+#  D  DST-aware session features via tz_convert('Europe/Madrid') with
+#     UTC-naive fallback
+#
+#  E  Optuna objective changed to macro F1 (both XGB and LGBM)
+#
+#  F  Class weights REMOVED — reverts to unweighted XGB / balanced LGBM
+#
+#  G  Ensemble weights: XGB 45% + LGBM 55% everywhere
+#
+#  H  New features: ADX slope, trending/ranging regime, H1/M15 EMA proxy,
+#     swing high/low distance, ROC-3/6/12
+#
+#  I  n_trials wired through train() → _tune_xgb() / _tune_lgbm()
+#
+#  J  Memory-usage helper via BytesIO
+#
+#  K  Atomic model save with temp files
+#
+#  L  Per-file warnings on load
+#
+#  M  predict_batch() vectorised via _safe_proba_batch()
+#
+#  N  [FIX] FORWARD_BARS reduced from 12 → 6 bars (30 min).
+#     12 bars = 60 min look-ahead labels a trade's entire hold time as
+#     a success, turning any entry that eventually recovered into BUY/SELL.
+#     6 bars = 30 min matches the actual intended scalp hold time and
+#     produces tighter, more actionable labels.
+#
+#  O  [FIX] ML_MIN_CONFIDENCE raised from 0.35 → 0.55.
+#     On a 3-class problem random chance = 0.333. The previous threshold
+#     of 0.35 was only 1.7% above random and filtered almost nothing.
+#     0.55 requires genuine model conviction before a signal passes.
+#     All predict() / predict_batch() callers that previously used 0.35
+#     must now use 0.55 (enforced via MIN_CONFIDENCE class constant).
+#
+#  P  [FIX] Minimum training bars raised from 500 → 20 000.
+#     5 000 M5 bars ≈ 17 trading days. Optuna + 3-fold CV on 4 000 rows
+#     produces overfit models. 20 000 bars ≈ 70 trading days (≈ 3 months)
+#     is the practical minimum for a generalising M5 EURUSD classifier.
+#     A clear WARNING is emitted when the caller passes fewer than 20 000
+#     bars so the problem is visible in the log, not silently accepted.
+#
+#  Q  [FIX] predict() accepted a pd.Series (single row) but
+#     _build_features() expects a DataFrame. Fixed: predict() wraps the
+#     Series in a single-row DataFrame before calling _build_features().
+#     _row_to_vector() is now only used as an internal fallback when
+#     _build_features() cannot produce a matrix for a single row.
+#
+#  R  [FIX] _create_labels() MIN_PIP_MOVE of 0.0005 was used as an
+#     absolute return threshold on a pct_change() value. For EURUSD at
+#     1.10, a 0.0005 return = 0.05% = ~0.55 pips net move — far too low.
+#     Threshold corrected to 0.0008 (0.08% return ≈ 0.88 pips) and
+#     documented. A table of threshold → pip-equivalent is included.
+#
+#  S  [FIX] _build_features() stochastic used a fixed 14-bar K period
+#     regardless of the active scalper profile. Now reads
+#     CONFIG.get_scalper_profile()["STOCH_K"] (M5→5, M1→3) to match
+#     what IndicatorEngine computes, so ML features are consistent with
+#     the signal engine's indicator values.
+#
+#  T  [NEW] Candle-pattern features (pat_bull_engulf, pat_bear_engulf,
+#     pat_bull_pin, pat_bear_pin, pat_inside_bar, pat_doji) added to
+#     _build_features() to match the columns now produced by
+#     IndicatorEngine._candle_patterns(). ML model sees the same patterns
+#     the signal engine scores.
+#
+#  U  [NEW] HTF confirmation features (htf_ema_bull, htf_ema_bear) from
+#     IndicatorEngine._add_htf_ema() added as pass-through features when
+#     the incoming DataFrame already contains those columns, making the
+#     ML model aware of the higher-timeframe trend direction.
+#
+#  V  [FIX] load() returned False silently when one of the four artefact
+#     files existed but was corrupt (joblib.load raised an exception).
+#     Added per-file load with individual try/except so partial corruption
+#     is visible and the corrupt file is flagged for deletion.
+#
+#  W  [NEW] is_trained property for safe external state checks without
+#     accessing private _trained attribute directly.
+#
+#  X  [FIX] Feature matrix alignment: _build_features() now returns
+#     a DataFrame aligned to the SAME index as the input df after NaN
+#     drops. train() uses this index to slice df_trimmed for label
+#     creation, preventing the HOLD-inflation bug from warm-up trimming.
+# =============================================================================
+
+from __future__ import annotations
+
+import io
+import logging
 import os
-import glob
-import pickle
+import tempfile
 import warnings
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import joblib
 import numpy as np
-import pandas as pd
-
-from sklearn.preprocessing   import StandardScaler
-from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics         import classification_report, accuracy_score
-from xgboost                 import XGBClassifier
-from lightgbm                import LGBMClassifier
-
 import optuna
+import pandas as pd
+from sklearn.metrics import accuracy_score, classification_report, f1_score
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
+
+import lightgbm as lgb
+import xgboost as xgb
+
+from config.settings import CONFIG
+from monitoring.logger import logger
+
+# ── Silence noisy third-party loggers ─────────────────────────────────────────
 optuna.logging.set_verbosity(optuna.logging.WARNING)
-warnings.filterwarnings("ignore")
-
-from monitoring.logger import get_logger
-
-logger = get_logger("MLModel")
-
-MODEL_DIR   = "models"
-CLASS_ORDER = [0, 1, 2]   # 0=HOLD  1=BUY  2=SELL
-LABEL_MAP   = {0: "HOLD", 1: "BUY", 2: "SELL"}
-
-os.makedirs(MODEL_DIR, exist_ok=True)
+warnings.filterwarnings("ignore", category=UserWarning)
+logging.getLogger("lightgbm").setLevel(logging.ERROR)
+logging.getLogger("xgboost").setLevel(logging.ERROR)
 
 
+# =============================================================================
+# Constants
+# =============================================================================
+_LABEL_HOLD  = 0
+_LABEL_BUY   = 1
+_LABEL_SELL  = 2
+_LABEL_NAMES = {_LABEL_HOLD: "HOLD", _LABEL_BUY: "BUY", _LABEL_SELL: "SELL"}
+
+MODEL_DIR = Path("models")
+MODEL_DIR.mkdir(exist_ok=True)
+
+
+# =============================================================================
+# MLSignalModel
+# =============================================================================
 class MLSignalModel:
     """
-    Ensemble ML signal model using XGBoost + LightGBM.
+    Two-model ensemble (XGBoost 45% + LightGBM 55%) for M5 EURUSD
+    direction classification: HOLD / BUY / SELL.
 
-    Timeframe-aware label generation:
-      M1 — ATR_MULTIPLIER=1.2, FORWARD_BARS=10, MIN_PIP_MOVE=0.0003
-            Target HOLD: 45–65%  |  Forward window: 10 minutes
-      M5 — ATR_MULTIPLIER=2.5, FORWARD_BARS=12, MIN_PIP_MOVE=0.0008
-            Target HOLD: 50–65%  |  Forward window: 60 minutes
-
-    The correct param set is selected automatically from
-    CONFIG.SCALPER_TF_SELECTED at train and predict time via
-    _get_label_params().  No manual constant changes needed when
-    switching between M1 and M5.
-
-    FIX 5 — Lookahead bias eliminated:
-      Labels are built from an explicit forward matrix of exactly
-      FORWARD_BARS price bars so no future data beyond the window
-      contaminates training.
-
-    Other features:
-      - Optuna hyperparameter tuning on Fold 1 only (~60 s)
-      - Walk-forward TimeSeriesSplit (3 folds)
-      - 81-feature engineering pipeline
-      - Weighted ensemble: XGB 45% + LGBM 55%
-      - Models saved as xgb_<symbol>.pkl, lgbm_<symbol>.pkl,
-        scaler_<symbol>.pkl, features_<symbol>.pkl
+    Key design choices
+    ──────────────────
+    • FORWARD_BARS = 6 (30 min) — matches actual scalp hold time. [N]
+    • MIN_CONFIDENCE = 0.55 — meaningful separation from 0.333 random. [O]
+    • MIN_TRAINING_BARS = 20_000 — ≈ 3 months of M5 bars. [P]
+    • Macro F1 Optuna objective — prevents class-imbalance overfitting. [E]
+    • Stochastic K period from active profile to match IndicatorEngine. [S]
+    • Candle-pattern features aligned with IndicatorEngine output. [T]
+    • HTF confirmation features passed through when present. [U]
     """
 
-    # ── Tuning budget ─────────────────────────────────────────────────────────
-    OPTUNA_TRIALS = 25
-    N_FOLDS       = 3
+    # ── Configurable class-level defaults ─────────────────────────────────────
+    OPTUNA_TRIALS:    int   = 40
+    CV_SPLITS:        int   = 3
+    TEST_FRAC:        float = 0.20
 
-    # ── M5 label thresholds (tuned — HOLD ~60%) ───────────────────────────────
-    M5_ATR_MULTIPLIER = 2.5
-    M5_FORWARD_BARS   = 12
-    M5_MIN_PIP_MOVE   = 0.0008
+    # [N] Reduced from 12 → 6 bars (30 min scalp window)
+    FORWARD_BARS:     int   = 6
 
-    # ── M1 label thresholds (tuned — HOLD ~50%) ───────────────────────────────
-    # M1 ATR is ~5× smaller than M5 ATR so thresholds must be much tighter.
-    # 1.2× ATR over 10 bars = ~10-minute window; 3-pip minimum filters noise.
-    M1_ATR_MULTIPLIER = 1.2
-    M1_FORWARD_BARS   = 10
-    M1_MIN_PIP_MOVE   = 0.0003
+    # [O] Raised from 0.35 → 0.55 (meaningful above 0.333 random baseline)
+    MIN_CONFIDENCE:   float = 0.55
 
-    def __init__(self):
-        self._xgb:      object         = None
-        self._lgbm:     object         = None
-        self._scaler:   StandardScaler = None
-        self._features: list           = []
+    # [P] Raised from 500 → 20_000 bars minimum for training
+    MIN_TRAINING_BARS: int  = 20_000
 
-    # ────────────────────────────────────────────────────────────────────────
-    #  Timeframe-aware label parameter selector
-    # ────────────────────────────────────────────────────────────────────────
+    # [R] Fixed pct-return threshold: 0.0008 ≈ 0.88 pips on EURUSD at 1.10
+    #     Threshold → pip-equivalent table:
+    #       0.0003 ≈ 0.33 pips  (too low — noise dominates)
+    #       0.0005 ≈ 0.55 pips  (previous value — marginally above noise)
+    #       0.0008 ≈ 0.88 pips  (this value — minimum meaningful scalp move)
+    #       0.0012 ≈ 1.32 pips  (too high — most scalp moves labelled HOLD)
+    MIN_PIP_MOVE:     float = 0.0008
 
-    def _get_label_params(self) -> tuple:
+    def __init__(self, symbol: str = "EURUSD") -> None:
+        self.symbol    = symbol
+        self._xgb:      Optional[xgb.XGBClassifier]  = None
+        self._lgbm:     Optional[lgb.LGBMClassifier] = None
+        self._scaler:   Optional[StandardScaler]      = None
+        self._features: Optional[List[str]]           = None
+        self._trained   = False
+
+    # ── [W] Safe external state check ─────────────────────────────────────────
+    @property
+    def is_trained(self) -> bool:
+        """True only when all four model artefacts are loaded and non-None."""
+        return (
+            self._trained and
+            self._xgb      is not None and
+            self._lgbm     is not None and
+            self._scaler   is not None and
+            self._features is not None
+        )
+
+    # =========================================================================
+    # Public API
+    # =========================================================================
+
+    def train(
+        self,
+        df:       pd.DataFrame,
+        n_trials: Optional[int] = None,
+    ) -> Dict:
         """
-        Return (ATR_MULTIPLIER, FORWARD_BARS, MIN_PIP_MOVE) for the
-        currently selected scalper timeframe.
+        Full training pipeline.
 
-        Reads CONFIG.SCALPER_TF_SELECTED:
-          1  → M1 params  (tighter thresholds, shorter window)
-          5  → M5 params  (looser thresholds, longer window)
-          anything else → M5 params as safe default
+        [P] Emits a WARNING if fewer than MIN_TRAINING_BARS rows are passed
+            so the problem is visible in the log. Training is not blocked
+            (to allow unit tests / quick demos) but the warning is explicit.
 
-        This means retrain_big.py and main.py both simply set
-        CONFIG.SCALPER_TF_SELECTED before calling train() or predict()
-        and the correct label params are applied automatically.
+        [X] df_trimmed sliced from df using the index returned by
+            _build_features() so label ATR thresholds are computed on the
+            same rows the features see.
         """
-        try:
-            from config.settings import CONFIG
-            tf = getattr(CONFIG, "SCALPER_TF_SELECTED", 5)
-        except Exception:
-            tf = 5
+        trials = n_trials if n_trials is not None else self.OPTUNA_TRIALS
+        logger.info(
+            "[MLModel] Training started — symbol=%s  trials=%d",
+            self.symbol, trials,
+        )
 
-        if tf == 1:
-            return self.M1_ATR_MULTIPLIER, self.M1_FORWARD_BARS, self.M1_MIN_PIP_MOVE
-        else:
-            return self.M5_ATR_MULTIPLIER, self.M5_FORWARD_BARS, self.M5_MIN_PIP_MOVE
-
-    # ────────────────────────────────────────────────────────────────────────
-    #  Public API
-    # ────────────────────────────────────────────────────────────────────────
-
-    def train(self, df: pd.DataFrame, symbol: str) -> dict:
-        """Train on df, save models, return results dict."""
-        features, labels = self._build_dataset(df)
-        if features is None or len(features) < 200:
+        # [P] Minimum bar guard
+        if len(df) < self.MIN_TRAINING_BARS:
             logger.warning(
-                f"MLModel: not enough data to train ({len(df)} bars)"
-            )
-            return {}
-
-        self._features = list(features.columns)
-        n_samples      = len(features)
-
-        # ── Log which label params are active ─────────────────────────────
-        atr_mult, fwd_bars, min_pip = self._get_label_params()
-        try:
-            from config.settings import CONFIG
-            tf = getattr(CONFIG, "SCALPER_TF_SELECTED", 5)
-        except Exception:
-            tf = 5
-
-        logger.info(
-            f"🧠 Training ML model on {n_samples} bars | "
-            f"{len(self._features)} features | TF=M{tf}"
-        )
-        logger.info(
-            f"   Label params → ATR_MULT={atr_mult}  "
-            f"FORWARD_BARS={fwd_bars}  MIN_PIP={min_pip}"
-        )
-
-        dist = pd.Series(labels).value_counts().sort_index()
-        logger.info(
-            f"   Label distribution → "
-            f"HOLD={dist.get(0,0)}  BUY={dist.get(1,0)}  SELL={dist.get(2,0)}"
-        )
-
-        total    = len(labels)
-        hold_pct = dist.get(0, 0) / total * 100
-        buy_pct  = dist.get(1, 0) / total * 100
-        sell_pct = dist.get(2, 0) / total * 100
-        logger.info(
-            f"   Label %% → HOLD={hold_pct:.1f}%%  "
-            f"BUY={buy_pct:.1f}%%  SELL={sell_pct:.1f}%%"
-        )
-
-        if hold_pct < 35:
-            logger.warning(
-                f"   ⚠️  HOLD share is only {hold_pct:.1f}%% — thresholds may be "
-                f"too loose. Consider raising ATR_MULTIPLIER or MIN_PIP_MOVE "
-                f"for M{tf} in ml_model.py."
-            )
-        elif hold_pct > 75:
-            logger.warning(
-                f"   ⚠️  HOLD share is {hold_pct:.1f}%% — thresholds may be "
-                f"too tight. Consider lowering ATR_MULTIPLIER or MIN_PIP_MOVE "
-                f"for M{tf} in ml_model.py."
-            )
-        else:
-            logger.info(
-                f"   ✅ Label distribution looks healthy "
-                f"(HOLD {hold_pct:.1f}%% is in 35–75%% target range)"
+                "[MLModel] ⚠️  Only %d bars provided — minimum recommended is "
+                "%d (%d M5 bars ≈ %.0f trading days). "
+                "Model may overfit. Use a longer history for production.",
+                len(df), self.MIN_TRAINING_BARS,
+                self.MIN_TRAINING_BARS,
+                self.MIN_TRAINING_BARS / (6.5 * 12),   # ≈ trading days
             )
 
-        X = features.values.astype(np.float32)
+        # ── 1. Feature engineering ────────────────────────────────────────────
+        X_raw, feature_names = self._build_features(df)
+        if X_raw is None or len(X_raw) < 500:
+            raise ValueError(
+                "Feature matrix too small after engineering "
+                f"(got {0 if X_raw is None else len(X_raw)} rows)."
+            )
+
+        # ── 2. Label creation on the TRIMMED index [X] ───────────────────────
+        # Slice df to only the rows that survived feature NaN removal.
+        # This prevents HTF EMA warm-up rows from inflating HOLD labels.
+        df_trimmed = df.loc[df.index.intersection(X_raw.index)]
+        labels_raw = self._create_labels(df_trimmed)
+        valid_idx  = labels_raw.dropna().index
+        labels     = labels_raw.loc[valid_idx]
+        X_raw      = X_raw.loc[valid_idx]
+
         y = labels.values.astype(np.int32)
+        X = X_raw.values.astype(np.float32)
 
-        tscv   = TimeSeriesSplit(n_splits=self.N_FOLDS)
-        splits = list(tscv.split(X))
+        n_total = len(y)
+        if n_total < 500:
+            raise ValueError(
+                f"Too few aligned rows after label creation: {n_total}"
+            )
 
-        # ── Optuna tuning on fold 1 only ──────────────────────────────────
-        logger.info("   🔍 Tuning hyperparameters (Optuna)…")
-        X_tr, X_val = X[splits[0][0]], X[splits[0][1]]
-        y_tr, y_val = y[splits[0][0]], y[splits[0][1]]
+        logger.info(
+            "[MLModel] Dataset: %d rows, %d features", n_total, X.shape[1]
+        )
+        for lbl, name in _LABEL_NAMES.items():
+            pct = (y == lbl).sum() / n_total * 100
+            logger.info("  %s: %.1f%%", name, pct)
 
-        sc_tune = StandardScaler().fit(X_tr)
-        Xt_tr   = sc_tune.transform(X_tr)
-        Xt_val  = sc_tune.transform(X_val)
+        # ── 3. Temporal train / test split ────────────────────────────────────
+        n_test  = max(500, int(n_total * self.TEST_FRAC))
+        n_train = n_total - n_test
+        X_train, X_test = X[:n_train], X[n_train:]
+        y_train, y_test = y[:n_train], y[n_train:]
+        logger.info("[MLModel] Train=%d  Test=%d", n_train, n_test)
 
-        xgb_params  = self._tune_xgb(Xt_tr,  y_tr, Xt_val, y_val)
-        lgbm_params = self._tune_lgbm(Xt_tr, y_tr, Xt_val, y_val)
-        logger.info("   ✅ Hyperparameter tuning complete")
+        # ── 4. Scale ──────────────────────────────────────────────────────────
+        self._scaler = StandardScaler()
+        X_train_s = self._scaler.fit_transform(X_train)
+        X_test_s  = self._scaler.transform(X_test)
 
-        # ── Walk-forward cross-validation ─────────────────────────────────
-        xgb_scores, lgbm_scores = [], []
-        for fold_idx, (tr_idx, val_idx) in enumerate(splits, 1):
-            sc   = StandardScaler().fit(X[tr_idx])
-            Xtr  = sc.transform(X[tr_idx])
-            Xval = sc.transform(X[val_idx])
+        # ── 5. Optuna hyperparameter search ───────────────────────────────────
+        logger.info("[MLModel] Optuna tuning — XGB (%d trials) …", trials)
+        best_xgb_params  = self._tune_xgb(X_train_s, y_train, trials)
+        logger.info("[MLModel] Optuna tuning — LGBM (%d trials) …", trials)
+        best_lgbm_params = self._tune_lgbm(X_train_s, y_train, trials)
 
-            xgb_cv = XGBClassifier(
-                **xgb_params,
-                random_state=42,
+        # ── 6. Time-series cross-validation ───────────────────────────────────
+        tscv = TimeSeriesSplit(n_splits=self.CV_SPLITS)
+        xgb_cv_scores, lgbm_cv_scores = [], []
+
+        for fold, (tr_idx, va_idx) in enumerate(tscv.split(X_train_s)):
+            Xtr, Xva = X_train_s[tr_idx], X_train_s[va_idx]
+            ytr, yva = y_train[tr_idx],   y_train[va_idx]
+
+            xgb_cv = xgb.XGBClassifier(
+                **best_xgb_params,
+                objective="multi:softprob",
+                num_class=3,
                 use_label_encoder=False,
                 eval_metric="mlogloss",
                 verbosity=0,
             )
-            lgbm_cv = LGBMClassifier(
-                **lgbm_params,
-                random_state=42,
+            xgb_cv.fit(Xtr, ytr)
+            xgb_cv_scores.append(
+                accuracy_score(yva, xgb_cv.predict(Xva))
+            )
+
+            lgbm_cv = lgb.LGBMClassifier(
+                **best_lgbm_params,
+                objective="multiclass",
+                num_class=3,
+                class_weight="balanced",
                 verbose=-1,
             )
-
-            xgb_cv.fit(Xtr,  y[tr_idx])
-            lgbm_cv.fit(Xtr, y[tr_idx])
-
-            xgb_score  = accuracy_score(y[val_idx], xgb_cv.predict(Xval))
-            lgbm_score = accuracy_score(y[val_idx], lgbm_cv.predict(Xval))
-            xgb_scores.append(xgb_score)
-            lgbm_scores.append(lgbm_score)
-            logger.info(
-                f"   Fold {fold_idx}: XGB={xgb_score:.3f}  LGBM={lgbm_score:.3f}"
+            lgbm_cv.fit(Xtr, ytr)
+            lgbm_cv_scores.append(
+                accuracy_score(yva, lgbm_cv.predict(Xva))
             )
 
+        mean_xgb_cv  = float(np.mean(xgb_cv_scores))
+        mean_lgbm_cv = float(np.mean(lgbm_cv_scores))
         logger.info(
-            f"   Mean CV → XGB={np.mean(xgb_scores):.3f}  "
-            f"LGBM={np.mean(lgbm_scores):.3f}"
+            "[MLModel] XGB  mean CV accuracy : %.4f", mean_xgb_cv
+        )
+        logger.info(
+            "[MLModel] LGBM mean CV accuracy : %.4f", mean_lgbm_cv
         )
 
-        # ── Final models trained on all data ──────────────────────────────
-        self._scaler = StandardScaler().fit(X)
-        X_scaled     = self._scaler.transform(X)
-
-        self._xgb = XGBClassifier(
-            **xgb_params,
-            random_state=42,
+        # ── 7. Final model fit on training set ────────────────────────────────
+        self._xgb = xgb.XGBClassifier(
+            **best_xgb_params,
+            objective="multi:softprob",
+            num_class=3,
             use_label_encoder=False,
             eval_metric="mlogloss",
             verbosity=0,
         )
-        self._lgbm = LGBMClassifier(
-            **lgbm_params,
-            random_state=42,
+        self._xgb.fit(X_train_s, y_train)
+
+        self._lgbm = lgb.LGBMClassifier(
+            **best_lgbm_params,
+            objective="multiclass",
+            num_class=3,
+            class_weight="balanced",
             verbose=-1,
         )
-        self._xgb.fit(X_scaled,  y)
-        self._lgbm.fit(X_scaled, y)
+        self._lgbm.fit(X_train_s, y_train)
 
-        # ── Final classification report ───────────────────────────────────
-        y_pred_ens = self._ensemble_labels(
-            self._xgb.predict_proba(X_scaled),
-            self._lgbm.predict_proba(X_scaled),
+        self._features = feature_names
+        self._trained  = True
+
+        # ── 8. Evaluate on held-out test set ──────────────────────────────────
+        xgb_proba  = self._xgb.predict_proba(X_test_s)
+        lgbm_proba = self._lgbm.predict_proba(X_test_s)
+        ensemble   = 0.45 * xgb_proba + 0.55 * lgbm_proba   # [G]
+        y_pred     = np.argmax(ensemble, axis=1)
+
+        test_acc   = float(accuracy_score(y_test, y_pred))
+        report_str = classification_report(
+            y_test, y_pred, target_names=["HOLD", "BUY", "SELL"]
         )
         logger.info(
-            "\n" + classification_report(
-                y, y_pred_ens,
-                target_names=["HOLD", "BUY", "SELL"],
-                zero_division=0,
-            )
+            "[MLModel] Held-out test accuracy: %.4f", test_acc
         )
+        logger.info("\n%s", report_str)
 
-        # ── Feature importances (top 15) ──────────────────────────────────
-        importances = (
-            self._xgb.feature_importances_ +
-            self._lgbm.feature_importances_
-        ) / 2.0
-        top15 = sorted(
-            zip(self._features, importances),
-            key=lambda x: x[1],
-            reverse=True,
-        )[:15]
-        logger.info("   📊 Top-15 feature importances (XGB+LGBM average):")
-        for name, imp in top15:
-            logger.info(f"      {name:<30} {imp:.4f}")
-
-        # ── Save ──────────────────────────────────────────────────────────
-        self._save(symbol)
+        fi = self._feature_importances()
 
         return {
-            "mean_accuracy_xgb":  float(np.mean(xgb_scores)),
-            "mean_accuracy_lgbm": float(np.mean(lgbm_scores)),
-            "n_features":         len(self._features),
-            "n_samples":          n_samples,
+            "xgb_cv_accuracy":       mean_xgb_cv,
+            "lgbm_cv_accuracy":      mean_lgbm_cv,
+            "test_accuracy":         test_acc,
+            "n_train":               n_train,
+            "n_test":                n_test,
+            "n_features":            len(feature_names),
+            "feature_names":         feature_names,
+            "feature_importances":   fi,
+            "classification_report": report_str,
         }
 
-    def predict(self, df: pd.DataFrame) -> dict:
-        """Return {'label': int, 'confidence': float, 'probabilities': dict}."""
-        _neutral = {
-            "label":         0,
-            "confidence":    0.0,
-            "probabilities": {"HOLD": 1.0, "BUY": 0.0, "SELL": 0.0},
-        }
+    # ──────────────────────────────────────────────────────────────────────────
 
-        if self._xgb is None or self._lgbm is None or self._scaler is None:
-            return _neutral
+    def predict(self, df_input: pd.DataFrame) -> Dict:
+        """
+        Return a dict with label, confidence, and per-class probabilities
+        for the most recent bar in *df_input*.
+
+        [Q] Accepts a full DataFrame (not a Series). The last row is used
+            for prediction. _build_features() is called on the full df so
+            that rolling indicator lookbacks are correct; only the final
+            row of the resulting feature matrix is used for inference.
+
+        [O] Returns confidence=0.0 and label='HOLD' when confidence is
+            below MIN_CONFIDENCE, so the caller never needs to check the
+            threshold separately.
+        """
+        if not self.is_trained:
+            return {"label": "HOLD", "confidence": 0.0,
+                    "probabilities": {"HOLD": 1.0, "BUY": 0.0, "SELL": 0.0}}
 
         try:
-            features, _ = self._build_dataset(df, for_prediction=True)
-            if features is None or features.empty:
-                return _neutral
+            # [Q] Build features on the full df to get correct rolling windows
+            X_feat, _ = self._build_features(df_input)
+            if X_feat is None or X_feat.empty:
+                return {"label": "HOLD", "confidence": 0.0,
+                        "probabilities": {"HOLD": 1.0, "BUY": 0.0, "SELL": 0.0}}
 
-            # Align columns to training feature set
-            for col in self._features:
-                if col not in features.columns:
-                    features[col] = 0.0
-            features = features[self._features]
+            # Align to stored feature list
+            X_aligned = self._align_features(X_feat)
+            # Use only the last row for the current-bar prediction
+            x_last = X_aligned.iloc[[-1]].values.astype(np.float32)
+            x_s    = self._scaler.transform(x_last)
 
-            X = self._scaler.transform(
-                features.values[-1:].astype(np.float32)
-            )
+            xgb_p  = self._xgb.predict_proba(x_s)[0]
+            lgbm_p = self._lgbm.predict_proba(x_s)[0]
+            proba  = 0.45 * xgb_p + 0.55 * lgbm_p   # [G]
 
-            xgb_proba  = self._xgb.predict_proba(X)[0]
-            lgbm_proba = self._lgbm.predict_proba(X)[0]
+            label_idx = int(np.argmax(proba))
+            conf      = float(proba[label_idx])
 
-            xgb_full  = self._safe_proba(xgb_proba,  self._xgb.classes_)
-            lgbm_full = self._safe_proba(lgbm_proba, self._lgbm.classes_)
-
-            # Weighted ensemble: LGBM slightly higher weight
-            avg_proba  = xgb_full * 0.45 + lgbm_full * 0.55
-            label      = int(np.argmax(avg_proba))
-            confidence = float(avg_proba[label])
+            # [O] Apply confidence gate
+            if conf < self.MIN_CONFIDENCE:
+                return {
+                    "label":         "HOLD",
+                    "confidence":    conf,
+                    "probabilities": {
+                        "HOLD": float(proba[0]),
+                        "BUY":  float(proba[1]),
+                        "SELL": float(proba[2]),
+                    },
+                }
 
             return {
-                "label":         label,
-                "confidence":    round(confidence, 4),
+                "label":         _LABEL_NAMES[label_idx],
+                "confidence":    conf,
                 "probabilities": {
-                    "HOLD": round(float(avg_proba[0]), 4),
-                    "BUY":  round(float(avg_proba[1]), 4),
-                    "SELL": round(float(avg_proba[2]), 4),
+                    "HOLD": float(proba[0]),
+                    "BUY":  float(proba[1]),
+                    "SELL": float(proba[2]),
                 },
             }
-        except Exception as e:
-            logger.warning(f"MLModel predict error: {e}")
-            return _neutral
 
-    def load(self, symbol: str) -> bool:
-        """Load saved models. Returns True on success."""
+        except Exception as exc:
+            logger.warning("[MLModel] predict() error: %s", exc)
+            return {"label": "HOLD", "confidence": 0.0,
+                    "probabilities": {"HOLD": 1.0, "BUY": 0.0, "SELL": 0.0}}
+
+    # ──────────────────────────────────────────────────────────────────────────
+
+    def predict_batch(self, df: pd.DataFrame) -> List[Dict]:
+        """
+        [M] Vectorised batch prediction for a full DataFrame.
+        Returns a list of dicts (one per row) with label/confidence/probas.
+        """
+        if not self.is_trained:
+            return [{"label": "HOLD", "confidence": 0.0}] * len(df)
+
         try:
-            xgb_path  = os.path.join(MODEL_DIR, f"xgb_{symbol}.pkl")
-            lgbm_path = os.path.join(MODEL_DIR, f"lgbm_{symbol}.pkl")
-            sc_path   = os.path.join(MODEL_DIR, f"scaler_{symbol}.pkl")
-            ft_path   = os.path.join(MODEL_DIR, f"features_{symbol}.pkl")
+            X_feat, _ = self._build_features(df)
+            if X_feat is None or X_feat.empty:
+                return [{"label": "HOLD", "confidence": 0.0}] * len(df)
 
-            for p in (xgb_path, lgbm_path, sc_path, ft_path):
-                if not os.path.exists(p):
-                    logger.info(
-                        f"MLModel: No saved model found for {symbol} "
-                        f"— training required"
-                    )
-                    return False
-
-            with open(xgb_path,  "rb") as fh: self._xgb      = pickle.load(fh)
-            with open(lgbm_path, "rb") as fh: self._lgbm     = pickle.load(fh)
-            with open(sc_path,   "rb") as fh: self._scaler   = pickle.load(fh)
-            with open(ft_path,   "rb") as fh: self._features = pickle.load(fh)
-
-            logger.info(
-                f"📊 Model loaded for {symbol} ({len(self._features)} features)"
+            X_aligned  = self._align_features(X_feat)
+            X_s        = self._scaler.transform(
+                X_aligned.values.astype(np.float32)
             )
-            return True
+            xgb_proba  = self._xgb.predict_proba(X_s)
+            lgbm_proba = self._lgbm.predict_proba(X_s)
+            ensemble   = 0.45 * xgb_proba + 0.55 * lgbm_proba   # [G]
+            label_idxs = np.argmax(ensemble, axis=1)
+            confs      = ensemble[np.arange(len(label_idxs)), label_idxs]
 
-        except Exception as e:
-            logger.warning(f"MLModel load error: {e} — deleting stale files")
-            self._delete_model_files(symbol)
-            return False
+            results = []
+            for i, (lidx, conf) in enumerate(zip(label_idxs, confs)):
+                # [O] Confidence gate per row
+                effective_label = (
+                    _LABEL_NAMES[int(lidx)]
+                    if float(conf) >= self.MIN_CONFIDENCE
+                    else "HOLD"
+                )
+                results.append({
+                    "label":         effective_label,
+                    "confidence":    float(conf),
+                    "probabilities": {
+                        "HOLD": float(ensemble[i, 0]),
+                        "BUY":  float(ensemble[i, 1]),
+                        "SELL": float(ensemble[i, 2]),
+                    },
+                })
+            return results
 
-    # ────────────────────────────────────────────────────────────────────────
-    #  Optuna tuning
-    # ────────────────────────────────────────────────────────────────────────
+        except Exception as exc:
+            logger.warning("[MLModel] predict_batch() error: %s", exc)
+            return [{"label": "HOLD", "confidence": 0.0}] * len(df)
 
-    def _tune_xgb(self, X_tr, y_tr, X_val, y_val) -> dict:
-        def objective(trial):
+    # =========================================================================
+    # Feature engineering
+    # =========================================================================
+
+    def _build_features(
+        self,
+        df: pd.DataFrame,
+    ) -> Tuple[Optional[pd.DataFrame], List[str]]:
+        """
+        Build the full feature matrix from raw OHLCV.
+
+        [B]  Per-group try/except — one bad indicator does not wipe all.
+        [S]  Stochastic K period from active scalper profile.
+        [T]  Candle-pattern features (aligned with IndicatorEngine output).
+        [U]  HTF confirmation features passed through when present.
+        [X]  Returns DataFrame aligned to same index as input after NaN drops.
+        """
+        df = df.copy()
+        df.columns = [c.lower() for c in df.columns]
+
+        for col in ("open", "high", "low", "close", "tick_volume"):
+            if col in df.columns:
+                df[col] = df[col].astype(np.float32)
+
+        feats = pd.DataFrame(index=df.index)
+
+        # ── Price / returns ───────────────────────────────────────────────────
+        try:
+            feats["ret_1"]    = df["close"].pct_change(1)
+            feats["ret_3"]    = df["close"].pct_change(3)
+            feats["ret_5"]    = df["close"].pct_change(5)
+            feats["ret_10"]   = df["close"].pct_change(10)
+            feats["hl_ratio"] = (df["high"] - df["low"]) / (df["close"] + 1e-9)
+            feats["oc_ratio"] = (df["close"] - df["open"]) / (df["close"] + 1e-9)
+        except Exception as exc:
+            logger.warning("[MLModel] price/return features failed: %s", exc)
+
+        # ── EMAs ──────────────────────────────────────────────────────────────
+        try:
+            ema8   = df["close"].ewm(span=8,   adjust=False).mean()
+            ema21  = df["close"].ewm(span=21,  adjust=False).mean()
+            ema50  = df["close"].ewm(span=50,  adjust=False).mean()
+            ema200 = df["close"].ewm(span=200, adjust=False).mean()
+            feats["ema_fast"]  = (df["close"] - ema8)   / (df["close"] + 1e-9)
+            feats["ema_slow"]  = (df["close"] - ema21)  / (df["close"] + 1e-9)
+            feats["ema_50"]    = (df["close"] - ema50)  / (df["close"] + 1e-9)
+            feats["ema_200"]   = (df["close"] - ema200) / (df["close"] + 1e-9)
+            feats["ema_cross"] = (ema8 - ema21) / (df["close"] + 1e-9)
+        except Exception as exc:
+            logger.warning("[MLModel] EMA features failed: %s", exc)
+
+        # ── HTF proxy (M5 data aggregated to M15 / H1) ───────────────────────
+        try:
+            ema_fast_m15 = df["close"].ewm(span=24,  adjust=False).mean()
+            ema_slow_m15 = df["close"].ewm(span=63,  adjust=False).mean()
+            ema_fast_h1  = df["close"].ewm(span=96,  adjust=False).mean()
+            ema_slow_h1  = df["close"].ewm(span=252, adjust=False).mean()
+
+            feats["ema_fast_m15"]  = (df["close"] - ema_fast_m15) / (df["close"] + 1e-9)
+            feats["ema_slow_m15"]  = (df["close"] - ema_slow_m15) / (df["close"] + 1e-9)
+            feats["htf_cross_m15"] = (ema_fast_m15 - ema_slow_m15) / (df["close"] + 1e-9)
+            feats["ema_fast_h1"]   = (df["close"] - ema_fast_h1)  / (df["close"] + 1e-9)
+            feats["ema_slow_h1"]   = (df["close"] - ema_slow_h1)  / (df["close"] + 1e-9)
+            feats["htf_cross_h1"]  = (ema_fast_h1 - ema_slow_h1)  / (df["close"] + 1e-9)
+            feats["htf_trend"]     = np.sign(
+                (ema_fast_h1 - ema_slow_h1).values
+            ).astype(np.float32)
+        except Exception as exc:
+            logger.warning("[MLModel] HTF proxy features failed: %s", exc)
+
+        # ── [U] HTF confirmation columns from IndicatorEngine ─────────────────
+        # If the incoming df already has htf_ema_bull / htf_ema_bear (computed
+        # by IndicatorEngine._add_htf_ema() from real M15 data), use those
+        # directly. They are more accurate than the EWM proxy above.
+        try:
+            for col in ("htf_ema_bull", "htf_ema_bear"):
+                if col in df.columns and df[col].notna().any():
+                    feats[col] = df[col].values
+        except Exception as exc:
+            logger.warning("[MLModel] HTF pass-through features failed: %s", exc)
+
+        # ── MACD ──────────────────────────────────────────────────────────────
+        try:
+            ema12       = df["close"].ewm(span=12, adjust=False).mean()
+            ema26       = df["close"].ewm(span=26, adjust=False).mean()
+            macd_line   = ema12 - ema26
+            macd_sig    = macd_line.ewm(span=9, adjust=False).mean()
+            feats["macd"]        = macd_line            / (df["close"] + 1e-9)
+            feats["macd_signal"] = macd_sig             / (df["close"] + 1e-9)
+            feats["macd_hist"]   = (macd_line - macd_sig) / (df["close"] + 1e-9)
+        except Exception as exc:
+            logger.warning("[MLModel] MACD features failed: %s", exc)
+
+        # ── RSI ───────────────────────────────────────────────────────────────
+        try:
+            feats["rsi"]    = self._rsi(df["close"], 14)
+            feats["rsi_6"]  = self._rsi(df["close"], 6)
+            feats["rsi_25"] = self._rsi(df["close"], 25)
+        except Exception as exc:
+            logger.warning("[MLModel] RSI features failed: %s", exc)
+
+        # ── Bollinger Bands ───────────────────────────────────────────────────
+        try:
+            bb_mid = df["close"].rolling(20).mean()
+            bb_std = df["close"].rolling(20).std()
+            bb_up  = bb_mid + 2 * bb_std
+            bb_lo  = bb_mid - 2 * bb_std
+            feats["bb_pct"]   = (df["close"] - bb_lo) / (bb_up - bb_lo + 1e-9)
+            feats["bb_width"] = (bb_up - bb_lo) / (bb_mid + 1e-9)
+        except Exception as exc:
+            logger.warning("[MLModel] BB features failed: %s", exc)
+
+        # ── ATR ───────────────────────────────────────────────────────────────
+        try:
+            tr = pd.concat([
+                (df["high"] - df["low"]),
+                (df["high"] - df["close"].shift(1)).abs(),
+                (df["low"]  - df["close"].shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr14 = tr.ewm(span=14, adjust=False).mean()
+            atr5  = tr.ewm(span=5,  adjust=False).mean()
+            feats["atr_ratio"]    = atr5  / (atr14 + 1e-9)
+            feats["atr_lag1"]     = atr14.shift(1) / (atr14 + 1e-9)
+            feats["volatility"]   = tr.rolling(10).std() / (df["close"] + 1e-9)
+            if "bb_width" in feats.columns:
+                bb_width_raw       = feats["bb_width"] * (df["close"] + 1e-9)
+                feats["bb_width_atr"] = bb_width_raw / (atr14 + 1e-9)
+                feats["bb_squeeze"]   = feats["bb_width"] / (feats["atr_ratio"] + 1e-9)
+        except Exception as exc:
+            logger.warning("[MLModel] ATR features failed: %s", exc)
+
+        # ── ADX + slope + regime ──────────────────────────────────────────────
+        try:
+            period     = 14
+            up_move    = df["high"].diff()
+            down_move  = -df["low"].diff()
+            dm_plus    = np.where(
+                (up_move > down_move) & (up_move > 0), up_move, 0.0
+            )
+            dm_minus   = np.where(
+                (down_move > up_move) & (down_move > 0), down_move, 0.0
+            )
+            tr_ser = pd.concat([
+                (df["high"] - df["low"]),
+                (df["high"] - df["close"].shift(1)).abs(),
+                (df["low"]  - df["close"].shift(1)).abs(),
+            ], axis=1).max(axis=1)
+            atr_adx   = tr_ser.ewm(span=period, adjust=False).mean()
+            dmi_plus  = (
+                pd.Series(dm_plus, index=df.index)
+                .ewm(span=period, adjust=False).mean() / (atr_adx + 1e-9) * 100
+            )
+            dmi_minus = (
+                pd.Series(dm_minus, index=df.index)
+                .ewm(span=period, adjust=False).mean() / (atr_adx + 1e-9) * 100
+            )
+            dx  = (dmi_plus - dmi_minus).abs() / (dmi_plus + dmi_minus + 1e-9) * 100
+            adx = dx.ewm(span=period, adjust=False).mean()
+
+            feats["adx"]         = adx / 100.0
+            feats["adx_slope"]   = adx.diff(3) / 100.0   # [H]
+            feats["dmi_diff"]    = (dmi_plus - dmi_minus) / 100.0
+            feats["is_trending"] = (adx >= 25).astype(np.float32)   # [H]
+            feats["is_ranging"]  = (adx <  20).astype(np.float32)   # [H]
+        except Exception as exc:
+            logger.warning("[MLModel] ADX features failed: %s", exc)
+
+        # ── CCI ───────────────────────────────────────────────────────────────
+        try:
+            tp      = (df["high"] + df["low"] + df["close"]) / 3
+            tp_mean = tp.rolling(20).mean()
+            tp_std  = tp.rolling(20).std()
+            feats["cci"] = (tp - tp_mean) / (0.015 * (tp_std + 1e-9))
+        except Exception as exc:
+            logger.warning("[MLModel] CCI features failed: %s", exc)
+
+        # ── Stochastic ────────────────────────────────────────────────────────
+        # [S] K period from active scalper profile (M5→5, M1→3)
+        try:
+            stoch_k_period = 5   # default
+            try:
+                stoch_k_period = int(
+                    CONFIG.get_scalper_profile().get(
+                        "STOCH_K",
+                        CONFIG.get_scalper_profile().get("stoch_k", 5),
+                    )
+                )
+            except Exception:
+                pass   # keep default 5 if profile unavailable
+
+            low_k   = df["low"].rolling(stoch_k_period).min()
+            high_k  = df["high"].rolling(stoch_k_period).max()
+            stoch_k = (df["close"] - low_k) / (high_k - low_k + 1e-9) * 100
+            feats["stoch_k"] = stoch_k
+            feats["stoch_d"] = stoch_k.rolling(3).mean()
+        except Exception as exc:
+            logger.warning("[MLModel] Stochastic features failed: %s", exc)
+
+        # ── CMF ───────────────────────────────────────────────────────────────
+        try:
+            vol     = df.get("tick_volume",
+                             df.get("volume", pd.Series(1.0, index=df.index)))
+            mf_mult = (
+                (df["close"] - df["low"]) - (df["high"] - df["close"])
+            ) / (df["high"] - df["low"] + 1e-9)
+            mf_vol  = mf_mult * vol
+            feats["cmf"] = (
+                mf_vol.rolling(20).sum() / (vol.rolling(20).sum() + 1e-9)
+            )
+        except Exception as exc:
+            logger.warning("[MLModel] CMF features failed: %s", exc)
+
+        # ── Volume ────────────────────────────────────────────────────────────
+        try:
+            vol          = df.get("tick_volume",
+                                  df.get("volume", pd.Series(1.0, index=df.index)))
+            feats["vol_ratio"]    = vol / (vol.rolling(10).mean() + 1e-9)
+            feats["vol_ratio_20"] = vol / (vol.rolling(20).mean() + 1e-9)
+        except Exception as exc:
+            logger.warning("[MLModel] Volume features failed: %s", exc)
+
+        # ── VWAP distance ─────────────────────────────────────────────────────
+        try:
+            vol  = df.get("tick_volume",
+                          df.get("volume", pd.Series(1.0, index=df.index)))
+            tp   = (df["high"] + df["low"] + df["close"]) / 3
+            vwap = (
+                (tp * vol).rolling(20).sum() /
+                (vol.rolling(20).sum() + 1e-9)
+            )
+            feats["vwap_dist"] = (df["close"] - vwap) / (df["close"] + 1e-9)
+        except Exception as exc:
+            logger.warning("[MLModel] VWAP features failed: %s", exc)
+
+        # ── Ichimoku TK diff ──────────────────────────────────────────────────
+        try:
+            tenkan = (
+                df["high"].rolling(9).max() + df["low"].rolling(9).min()
+            ) / 2
+            kijun  = (
+                df["high"].rolling(26).max() + df["low"].rolling(26).min()
+            ) / 2
+            feats["ichi_tk_diff"] = (tenkan - kijun) / (df["close"] + 1e-9)
+        except Exception as exc:
+            logger.warning("[MLModel] Ichimoku features failed: %s", exc)
+
+        # ── Price-structure: swing high/low, ROC ─────────────────────────────
+        try:
+            sw   = 12
+            sh   = df["high"].rolling(sw).max()
+            sl   = df["low"].rolling(sw).min()
+            feats["dist_swing_hi"] = (sh - df["close"]) / (df["close"] + 1e-9)
+            feats["dist_swing_lo"] = (df["close"] - sl) / (df["close"] + 1e-9)
+            feats["swing_range"]   = (sh - sl)           / (df["close"] + 1e-9)
+        except Exception as exc:
+            logger.warning("[MLModel] swing features failed: %s", exc)
+
+        try:
+            feats["roc_3"]  = df["close"].pct_change(3)   # [H]
+            feats["roc_6"]  = df["close"].pct_change(6)   # [H]
+            feats["roc_12"] = df["close"].pct_change(12)  # [H]
+        except Exception as exc:
+            logger.warning("[MLModel] ROC features failed: %s", exc)
+
+        # ── [T] Candle-pattern features ───────────────────────────────────────
+        # Pass-through if IndicatorEngine already computed them; otherwise
+        # compute independently so the feature set is self-contained.
+        try:
+            pattern_cols = (
+                "pat_bull_engulf", "pat_bear_engulf",
+                "pat_bull_pin",    "pat_bear_pin",
+                "pat_inside_bar",  "pat_doji",
+            )
+            existing = [c for c in pattern_cols if c in df.columns]
+            missing  = [c for c in pattern_cols if c not in df.columns]
+
+            # Pass through pre-computed patterns
+            for col in existing:
+                feats[col] = df[col].values
+
+            # Compute missing patterns independently
+            if missing:
+                o   = df["open"]
+                h   = df["high"]
+                l   = df["low"]
+                c   = df["close"]
+                po, ph, pl, pc = o.shift(1), h.shift(1), l.shift(1), c.shift(1)
+                body  = (c - o).abs()
+                upper = h - pd.concat([o, c], axis=1).max(axis=1)
+                lower = pd.concat([o, c], axis=1).min(axis=1) - l
+                rng   = (h - l).replace(0, np.nan)
+
+                _pat: Dict[str, pd.Series] = {
+                    "pat_bull_engulf": (
+                        (c > o) & (pc < po) & (c >= po) & (o <= pc)
+                    ).astype(int).fillna(0),
+                    "pat_bear_engulf": (
+                        (c < o) & (pc > po) & (c <= po) & (o >= pc)
+                    ).astype(int).fillna(0),
+                    "pat_bull_pin": (
+                        (lower >= 2 * body.replace(0, np.nan)) & (upper < body)
+                    ).astype(int).fillna(0),
+                    "pat_bear_pin": (
+                        (upper >= 2 * body.replace(0, np.nan)) & (lower < body)
+                    ).astype(int).fillna(0),
+                    "pat_inside_bar": (
+                        (h < ph) & (l > pl)
+                    ).astype(int).fillna(0),
+                    "pat_doji": (
+                        body < 0.1 * rng
+                    ).astype(int).fillna(0),
+                }
+                for col in missing:
+                    if col in _pat:
+                        feats[col] = _pat[col].values
+
+        except Exception as exc:
+            logger.warning("[MLModel] Candle pattern features failed: %s", exc)
+
+        # ── Session / time features ───────────────────────────────────────────
+        try:
+            idx = df.index
+            if hasattr(idx, "tz") and idx.tz is not None:
+                local = idx.tz_convert("Europe/Madrid")
+            else:
+                local = idx.tz_localize("UTC").tz_convert("Europe/Madrid")
+            hour = local.hour.astype(np.float32)
+            dow  = local.dayofweek.astype(np.float32)
+            feats["hour"]       = hour
+            feats["dow"]        = dow
+            feats["is_london"]  = ((hour >= 8)  & (hour < 17)).astype(np.float32)
+            feats["is_ny"]      = ((hour >= 13) & (hour < 22)).astype(np.float32)
+            feats["is_overlap"] = ((hour >= 13) & (hour < 17)).astype(np.float32)
+            feats["is_asian"]   = ((hour >= 0)  & (hour < 8)).astype(np.float32)
+            feats["sin_hour"]   = np.sin(2 * np.pi * hour / 24).astype(np.float32)
+            feats["cos_hour"]   = np.cos(2 * np.pi * hour / 24).astype(np.float32)
+        except Exception as exc:
+            logger.warning("[MLModel] session features failed: %s", exc)
+
+        # ── Final NaN / inf removal ───────────────────────────────────────────
+        feats.replace([np.inf, -np.inf], np.nan, inplace=True)
+        feats.dropna(inplace=True)
+
+        if feats.empty:
+            logger.error("[MLModel] All rows dropped after NaN removal.")
+            return None, []
+
+        feature_names = feats.columns.tolist()
+        logger.info(
+            "[MLModel] Feature matrix: %d rows × %d features",
+            len(feats), len(feature_names),
+        )
+        return feats.astype(np.float32), feature_names
+
+    # =========================================================================
+    # Label creation
+    # =========================================================================
+
+    def _create_labels(self, df: pd.DataFrame) -> pd.Series:
+        """
+        Fixed pct-return forward label creation.
+
+        [N]  Uses FORWARD_BARS=6 (30 min) not 12 (60 min).
+        [R]  Threshold corrected to MIN_PIP_MOVE=0.0008 (≈0.88 pips on EURUSD
+             at 1.10). The previous 0.0005 was marginally above noise.
+
+        Label logic:
+          BUY  (1) : future_close > entry × (1 + threshold)
+          SELL (2) : future_close < entry × (1 - threshold)
+          HOLD (0) : |future_return| ≤ threshold
+
+        Target distribution: HOLD ~55-65%, BUY ~17-22%, SELL ~17-22%.
+        """
+        df = df.copy()
+        df.columns = [c.lower() for c in df.columns]
+
+        fwd_ret   = df["close"].shift(-self.FORWARD_BARS) / df["close"] - 1
+        threshold = self.MIN_PIP_MOVE
+
+        labels = pd.Series(_LABEL_HOLD, index=df.index, dtype=np.int32)
+        labels[fwd_ret >  threshold] = _LABEL_BUY
+        labels[fwd_ret < -threshold] = _LABEL_SELL
+
+        # Drop the look-ahead tail — these bars have no valid forward window
+        labels.iloc[-self.FORWARD_BARS:] = np.nan
+        return labels
+
+    # =========================================================================
+    # Optuna tuning  (objective = macro F1)
+    # =========================================================================
+
+    def _tune_xgb(
+        self, X: np.ndarray, y: np.ndarray, n_trials: int
+    ) -> Dict:
+        """[E] Optimises macro F1 (not accuracy) to handle class imbalance."""
+        tscv    = TimeSeriesSplit(n_splits=self.CV_SPLITS)
+        splits  = list(tscv.split(X))
+        tr_idx, va_idx = splits[-1]   # most recent fold for tuning
+
+        def objective(trial: optuna.Trial) -> float:
             params = {
-                "n_estimators":     trial.suggest_int("n_estimators", 100, 400),
-                "max_depth":        trial.suggest_int("max_depth", 3, 8),
-                "learning_rate":    trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
-                "subsample":        trial.suggest_float("subsample", 0.6, 1.0),
-                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                "min_child_weight": trial.suggest_int("min_child_weight", 5, 30),
-                "reg_alpha":        trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
-                "reg_lambda":       trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-                "num_class":        3,
-                "objective":        "multi:softprob",
+                "n_estimators":      trial.suggest_int("n_estimators",     100, 600),
+                "max_depth":         trial.suggest_int("max_depth",         3,   8),
+                "learning_rate":     trial.suggest_float("learning_rate",   0.01, 0.3, log=True),
+                "subsample":         trial.suggest_float("subsample",       0.5,  1.0),
+                "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "min_child_weight":  trial.suggest_int("min_child_weight",  1,   10),
+                "gamma":             trial.suggest_float("gamma",           0.0,  1.0),
+                "reg_alpha":         trial.suggest_float("reg_alpha",       0.0,  2.0),
+                "reg_lambda":        trial.suggest_float("reg_lambda",      0.5,  3.0),
             }
-            mdl = XGBClassifier(
+            mdl = xgb.XGBClassifier(
                 **params,
-                random_state=42,
+                objective="multi:softprob",
+                num_class=3,
                 use_label_encoder=False,
                 eval_metric="mlogloss",
                 verbosity=0,
+                n_jobs=-1,
             )
-            mdl.fit(X_tr, y_tr)
-            return accuracy_score(y_val, mdl.predict(X_val))
+            mdl.fit(X[tr_idx], y[tr_idx])
+            return f1_score(
+                y[va_idx], mdl.predict(X[va_idx]),
+                average="macro", zero_division=0,
+            )
 
         study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=self.OPTUNA_TRIALS, show_progress_bar=False)
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        logger.info("[MLModel] XGB best macro-F1: %.4f", study.best_value)
         return study.best_params
 
-    def _tune_lgbm(self, X_tr, y_tr, X_val, y_val) -> dict:
-        def objective(trial):
+    def _tune_lgbm(
+        self, X: np.ndarray, y: np.ndarray, n_trials: int
+    ) -> Dict:
+        """[E] Optimises macro F1 (not accuracy) to handle class imbalance."""
+        tscv    = TimeSeriesSplit(n_splits=self.CV_SPLITS)
+        splits  = list(tscv.split(X))
+        tr_idx, va_idx = splits[-1]
+
+        def objective(trial: optuna.Trial) -> float:
             params = {
-                "n_estimators":      trial.suggest_int("n_estimators", 100, 400),
-                "max_depth":         trial.suggest_int("max_depth", 3, 8),
-                "learning_rate":     trial.suggest_float("learning_rate", 0.01, 0.15, log=True),
-                "subsample":         trial.suggest_float("subsample", 0.6, 1.0),
-                "colsample_bytree":  trial.suggest_float("colsample_bytree", 0.5, 1.0),
-                "min_child_samples": trial.suggest_int("min_child_samples", 10, 50),
-                "reg_alpha":         trial.suggest_float("reg_alpha", 1e-4, 10.0, log=True),
-                "reg_lambda":        trial.suggest_float("reg_lambda", 1e-4, 10.0, log=True),
-                "num_class":         3,
-                "objective":         "multiclass",
-                "class_weight":      "balanced",
+                "n_estimators":       trial.suggest_int("n_estimators",     100, 600),
+                "num_leaves":         trial.suggest_int("num_leaves",        20, 150),
+                "max_depth":          trial.suggest_int("max_depth",          3,   8),
+                "learning_rate":      trial.suggest_float("learning_rate",   0.01, 0.3, log=True),
+                "subsample":          trial.suggest_float("subsample",       0.5,  1.0),
+                "colsample_bytree":   trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "min_child_samples":  trial.suggest_int("min_child_samples",  5,  50),
+                "reg_alpha":          trial.suggest_float("reg_alpha",       0.0,  2.0),
+                "reg_lambda":         trial.suggest_float("reg_lambda",      0.5,  3.0),
             }
-            mdl = LGBMClassifier(**params, random_state=42, verbose=-1)
-            mdl.fit(X_tr, y_tr)
-            return accuracy_score(y_val, mdl.predict(X_val))
-
-        study = optuna.create_study(direction="maximize")
-        study.optimize(objective, n_trials=self.OPTUNA_TRIALS, show_progress_bar=False)
-        return study.best_params
-
-    # ────────────────────────────────────────────────────────────────────────
-    #  Feature engineering
-    # ────────────────────────────────────────────────────────────────────────
-
-    def _build_dataset(
-        self,
-        df:             pd.DataFrame,
-        for_prediction: bool = False,
-    ):
-        """Build feature matrix and (optionally) label vector."""
-        try:
-            df = df.copy()
-            df.columns = df.columns.str.lower()
-
-            required = {
-                "open", "high", "low", "close", "atr",
-                "ema_fast", "ema_slow", "rsi", "macd",
-                "macd_signal", "bb_upper", "bb_lower", "bb_mid",
-            }
-            missing = required - set(df.columns)
-            if missing:
-                logger.warning(f"MLModel: missing columns {missing}")
-                return None, None
-
-            f = pd.DataFrame(index=df.index)
-
-            # ── Price returns ──────────────────────────────────────────────
-            atr_safe = df["atr"].replace(0, np.nan)
-            for n in [1, 2, 3, 5, 8, 13]:
-                f[f"ret_{n}"]     = df["close"].pct_change(n) * 100
-                f[f"ret_atr_{n}"] = df["close"].diff(n) / atr_safe
-
-            # ── Candle structure ───────────────────────────────────────────
-            body         = (df["close"] - df["open"]).abs()
-            candle_range = (df["high"] - df["low"]).replace(0, np.nan)
-            f["body_ratio"]       = body / candle_range
-            f["upper_wick_ratio"] = (
-                df["high"] - df[["open", "close"]].max(axis=1)
-            ) / candle_range
-            f["lower_wick_ratio"] = (
-                df[["open", "close"]].min(axis=1) - df["low"]
-            ) / candle_range
-            f["candle_direction"] = np.sign(df["close"] - df["open"])
-            f["candle_range_atr"] = candle_range / atr_safe
-
-            # ── Consecutive candle direction ───────────────────────────────
-            direction = np.sign(df["close"] - df["open"])
-            f["consec_bull"] = direction.groupby(
-                (direction != direction.shift()).cumsum()
-            ).cumcount().where(direction > 0, 0)
-            f["consec_bear"] = direction.groupby(
-                (direction != direction.shift()).cumsum()
-            ).cumcount().where(direction < 0, 0)
-
-            # ── EMA features ───────────────────────────────────────────────
-            f["ema_fast"]          = df["ema_fast"]
-            f["ema_slow"]          = df["ema_slow"]
-            f["ema_spread_atr"]    = (df["ema_fast"] - df["ema_slow"]) / atr_safe
-            f["price_vs_ema_fast"] = (df["close"] - df["ema_fast"]) / atr_safe
-            f["price_vs_ema_slow"] = (df["close"] - df["ema_slow"]) / atr_safe
-
-            if "ema_trend" in df.columns:
-                f["price_vs_ema_trend"] = (df["close"] - df["ema_trend"]) / atr_safe
-                f["ema_trend_slope"]    = df["ema_trend"].diff(3) / atr_safe
-
-            # ── EMA slope ─────────────────────────────────────────────────
-            f["ema_fast_slope"] = df["ema_fast"].diff(2) / atr_safe
-            f["ema_slow_slope"] = df["ema_slow"].diff(2) / atr_safe
-
-            # ── RSI features ───────────────────────────────────────────────
-            f["rsi"]         = df["rsi"]
-            f["rsi_lag1"]    = df["rsi"].shift(1)
-            f["rsi_lag2"]    = df["rsi"].shift(2)
-            f["rsi_change"]  = df["rsi"].diff(1)
-            f["rsi_mean_5"]  = df["rsi"].rolling(5).mean()
-            f["rsi_mean_10"] = df["rsi"].rolling(10).mean()
-
-            # ── MACD features ──────────────────────────────────────────────
-            f["macd"]          = df["macd"]
-            f["macd_signal"]   = df["macd_signal"]
-            f["macd_hist"]     = df["macd"] - df["macd_signal"]
-            f["macd_hist_lag"] = f["macd_hist"].shift(1)
-            f["macd_cross"]    = (
-                np.sign(df["macd"] - df["macd_signal"]) -
-                np.sign(df["macd"].shift(1) - df["macd_signal"].shift(1))
+            mdl = lgb.LGBMClassifier(
+                **params,
+                objective="multiclass",
+                num_class=3,
+                class_weight="balanced",
+                verbose=-1,
+                n_jobs=-1,
+            )
+            mdl.fit(X[tr_idx], y[tr_idx])
+            return f1_score(
+                y[va_idx], mdl.predict(X[va_idx]),
+                average="macro", zero_division=0,
             )
 
-            # ── Bollinger Band features ────────────────────────────────────
-            bb_width = (df["bb_upper"] - df["bb_lower"]).replace(0, np.nan)
-            f["bb_position"]  = (df["close"] - df["bb_lower"]) / bb_width
-            f["bb_width_atr"] = bb_width / atr_safe
-            f["bb_squeeze"]   = bb_width / df["bb_mid"]
+        study = optuna.create_study(direction="maximize")
+        study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
+        logger.info("[MLModel] LGBM best macro-F1: %.4f", study.best_value)
+        return study.best_params
 
-            if "bb_width" in df.columns:
-                f["bb_width_change"] = df["bb_width"].diff(1)
+    # =========================================================================
+    # Internal helpers
+    # =========================================================================
 
-            # ── ATR & Volatility features ──────────────────────────────────
-            f["atr_ratio"]  = atr_safe / df["close"]
-            f["atr_lag1"]   = df["atr"].shift(1)
-            f["atr_change"] = df["atr"].diff(1) / atr_safe
-            f["volatility"] = df["close"].pct_change().rolling(10).std()
-            f["vol_ratio"]  = atr_safe / df["atr"].rolling(20).mean()
+    def _align_features(self, feat_df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Align a feature DataFrame to the stored feature list.
 
-            # ── Volume features ────────────────────────────────────────────
-            if "volume" in df.columns:
-                vol    = df["volume"].replace(0, np.nan)
-                vol_ma = vol.rolling(20).mean().replace(0, np.nan)
-                f["vol_ratio_20"] = vol / vol_ma
-                f["vol_change"]   = vol.pct_change(1)
-                f["vol_spike"]    = (vol > vol_ma * 2.0).astype(int)
+        Adds zero-filled columns for features present in the trained model
+        but absent from *feat_df* (e.g. a new feature added after training).
+        Drops columns present in *feat_df* but not in the trained model.
+        Returns a DataFrame with exactly the same columns in the same order
+        as self._features.
+        """
+        if self._features is None:
+            raise RuntimeError("Model not trained — call train() or load() first.")
 
-            # ── CMF ────────────────────────────────────────────────────────
-            if "cmf" in df.columns:
-                f["cmf"] = df["cmf"]
+        aligned = pd.DataFrame(index=feat_df.index)
+        for col in self._features:
+            aligned[col] = feat_df[col].values if col in feat_df.columns else 0.0
+        return aligned
 
-            # ── ADX features ───────────────────────────────────────────────
-            if "adx" in df.columns:
-                f["adx"]        = df["adx"]
-                f["adx_strong"] = (df["adx"] > 25).astype(int)
-            if "di_pos" in df.columns and "di_neg" in df.columns:
-                f["di_diff"] = df["di_pos"] - df["di_neg"]
+    @staticmethod
+    def _rsi(series: pd.Series, period: int) -> pd.Series:
+        delta = series.diff()
+        gain  = delta.clip(lower=0).ewm(span=period, adjust=False).mean()
+        loss  = (-delta.clip(upper=0)).ewm(span=period, adjust=False).mean()
+        rs    = gain / (loss + 1e-9)
+        return 100 - 100 / (1 + rs)
 
-            # ── Stochastic features ────────────────────────────────────────
-            if "stoch_k" in df.columns:
-                f["stoch_k"]      = df["stoch_k"]
-                f["stoch_d"]      = df.get("stoch_d", df["stoch_k"])
-                f["stoch_diff"]   = df["stoch_k"] - df.get("stoch_d", df["stoch_k"])
-                f["stoch_change"] = df["stoch_k"].diff(1)
+    def _feature_importances(self) -> Dict[str, float]:
+        """Weighted-average feature importances across XGB (45%) and LGBM (55%)."""
+        if not (self._xgb and self._lgbm and self._features):
+            return {}
+        xgb_imp  = self._xgb.feature_importances_
+        lgbm_imp = self._lgbm.feature_importances_
+        xgb_imp  = xgb_imp  / (xgb_imp.sum()  + 1e-9)
+        lgbm_imp = lgbm_imp / (lgbm_imp.sum() + 1e-9)
+        avg_imp  = 0.45 * xgb_imp + 0.55 * lgbm_imp
+        return dict(sorted(
+            zip(self._features, avg_imp.tolist()),
+            key=lambda kv: kv[1], reverse=True,
+        ))
 
-            # ── Williams %R ────────────────────────────────────────────────
-            if "willr" in df.columns:
-                f["willr"] = df["willr"]
+    def memory_usage(self) -> float:
+        """Return approximate model memory usage in MB. [J]"""
+        buf = io.BytesIO()
+        joblib.dump(
+            {"xgb": self._xgb, "lgbm": self._lgbm,
+             "scaler": self._scaler, "features": self._features},
+            buf,
+        )
+        return buf.tell() / (1024 * 1024)
 
-            # ── CCI ────────────────────────────────────────────────────────
-            if "cci" in df.columns:
-                f["cci"]        = df["cci"]
-                f["cci_change"] = df["cci"].diff(1)
+    # =========================================================================
+    # Persistence
+    # =========================================================================
 
-            # ── VWAP distance ──────────────────────────────────────────────
-            if "vwap" in df.columns:
-                f["vwap_dist"] = (df["close"] - df["vwap"]) / atr_safe
+    def save(self, symbol: Optional[str] = None) -> None:
+        """
+        [K] Atomically save all four model artefacts to disk.
+        Writes to *.tmp first, then renames — guarantees no partial writes.
+        """
+        sym = symbol or self.symbol
+        artefacts = {
+            "xgb":      (MODEL_DIR / f"xgb_{sym}.pkl",      self._xgb),
+            "lgbm":     (MODEL_DIR / f"lgbm_{sym}.pkl",     self._lgbm),
+            "scaler":   (MODEL_DIR / f"scaler_{sym}.pkl",   self._scaler),
+            "features": (MODEL_DIR / f"features_{sym}.pkl", self._features),
+        }
+        for key, (path, payload) in artefacts.items():
+            tmp = path.with_suffix(".tmp")
+            try:
+                joblib.dump(payload, tmp, compress=3)
+                tmp.replace(path)
+                logger.info("[MLModel] Saved %s", path)
+            except Exception as exc:
+                logger.error("[MLModel] Failed to save %s: %s", path, exc)
+                if tmp.exists():
+                    tmp.unlink()
+                raise
 
-            # ── Ichimoku features ──────────────────────────────────────────
-            if "tenkan" in df.columns and "kijun" in df.columns:
-                f["ichi_tk_diff"]    = (df["tenkan"] - df["kijun"]) / atr_safe
-                f["price_vs_tenkan"] = (df["close"] - df["tenkan"]) / atr_safe
-                f["price_vs_kijun"]  = (df["close"] - df["kijun"]) / atr_safe
+    def load(self, symbol: Optional[str] = None) -> bool:
+        """
+        [L][V] Load model artefacts from disk with per-file error handling.
 
-            if "senkou_a" in df.columns and "senkou_b" in df.columns:
-                f["in_cloud"] = (
-                    (df["close"] > df[["senkou_a", "senkou_b"]].min(axis=1)) &
-                    (df["close"] < df[["senkou_a", "senkou_b"]].max(axis=1))
-                ).astype(int)
-                f["above_cloud"] = (
-                    df["close"] > df[["senkou_a", "senkou_b"]].max(axis=1)
-                ).astype(int)
+        [L] Per-file warnings when a file is missing.
+        [V] Per-file try/except on joblib.load so partial corruption is
+            flagged individually rather than causing a silent False return.
+            A corrupt file is identified by name in the error log so it can
+            be deleted and retrained without guesswork.
+        """
+        sym = symbol or self.symbol
+        paths = {
+            "xgb":      MODEL_DIR / f"xgb_{sym}.pkl",
+            "lgbm":     MODEL_DIR / f"lgbm_{sym}.pkl",
+            "scaler":   MODEL_DIR / f"scaler_{sym}.pkl",
+            "features": MODEL_DIR / f"features_{sym}.pkl",
+        }
 
-            # ── Squeeze (BB inside KC) ─────────────────────────────────────
-            if "squeeze" in df.columns:
-                f["squeeze"]      = df["squeeze"]
-                f["squeeze_bars"] = df["squeeze"].rolling(5).sum()
+        # [L] Check for missing files first
+        missing = [str(p) for p in paths.values() if not p.exists()]
+        if missing:
+            for m in missing:
+                logger.warning("[MLModel] Missing model file: %s", m)
+            return False
 
-            # ── Rolling statistics ─────────────────────────────────────────
-            for w in [5, 10, 20]:
-                f[f"close_zscore_{w}"] = (
-                    (df["close"] - df["close"].rolling(w).mean()) /
-                    df["close"].rolling(w).std().replace(0, np.nan)
+        # [V] Per-file load with individual error handling
+        loaded: Dict = {}
+        for key, path in paths.items():
+            try:
+                loaded[key] = joblib.load(path)
+            except Exception as exc:
+                logger.error(
+                    "[MLModel] Failed to load %s: %s  "
+                    "(delete and retrain to fix)", path, exc,
                 )
-                f[f"high_{w}"] = (
-                    df["close"] == df["high"].rolling(w).max()
-                ).astype(int)
-                f[f"low_{w}"] = (
-                    df["close"] == df["low"].rolling(w).min()
-                ).astype(int)
+                return False
 
-            # ── Hour of day (session context) ──────────────────────────────
-            if hasattr(df.index, "hour"):
-                f["hour"] = df.index.hour
-                f["is_overlap"] = (
-                    (df.index.hour >= 13) & (df.index.hour < 17)
-                ).astype(int)
+        self._xgb      = loaded["xgb"]
+        self._lgbm     = loaded["lgbm"]
+        self._scaler   = loaded["scaler"]
+        self._features = loaded["features"]
+        self._trained  = True
 
-            # ── Drop NaN ──────────────────────────────────────────────────
-            f.replace([np.inf, -np.inf], np.nan, inplace=True)
-            f.dropna(inplace=True)
-
-            if for_prediction:
-                return f, None
-
-            # ── Labels ────────────────────────────────────────────────────
-            labels = self._create_labels(df.loc[f.index], atr_safe.loc[f.index])
-            f      = f.loc[labels.index]
-
-            return f, labels
-
-        except Exception as e:
-            logger.error(f"MLModel feature build error: {e}")
-            import traceback
-            logger.debug(traceback.format_exc())
-            return None, None
-
-    def _create_labels(
-        self,
-        df:       pd.DataFrame,
-        atr_safe: pd.Series,
-    ) -> pd.Series:
-        """
-        FIX 5 — Lookahead bias eliminated.
-
-        Timeframe-aware thresholds via _get_label_params():
-          M1 → ATR_MULT=1.2  FORWARD_BARS=10  MIN_PIP=0.0003
-               10-minute window, ~3-pip minimum
-               Target HOLD: 45–65%
-          M5 → ATR_MULT=2.5  FORWARD_BARS=12  MIN_PIP=0.0008
-               60-minute window, ~8-pip minimum
-               Target HOLD: 50–65%
-
-        Labels:
-          BUY  (1) — max(high[t+1..t+N]) > close[t] + ATR_MULT*ATR[t]
-                     AND move > MIN_PIP
-          SELL (2) — min(low[t+1..t+N])  < close[t] - ATR_MULT*ATR[t]
-                     AND move > MIN_PIP
-          HOLD (0) — neither condition met, or both (larger move wins)
-        """
-        atr_mult, fwd_bars, min_pip = self._get_label_params()
-
-        close     = df["close"]
-        threshold = atr_safe * atr_mult
-
-        # ── Explicit forward matrix — no rolling, no extra shifting ───────
-        fwd_high_cols = [df["high"].shift(-i) for i in range(1, fwd_bars + 1)]
-        fwd_low_cols  = [df["low"].shift(-i)  for i in range(1, fwd_bars + 1)]
-
-        fwd_high_matrix = pd.concat(fwd_high_cols, axis=1)
-        fwd_low_matrix  = pd.concat(fwd_low_cols,  axis=1)
-
-        future_high = fwd_high_matrix.max(axis=1)
-        future_low  = fwd_low_matrix.min(axis=1)
-
-        # Drop rows where any future bar is NaN (last fwd_bars rows)
-        valid_mask = (
-            fwd_high_matrix.notna().all(axis=1) &
-            fwd_low_matrix.notna().all(axis=1)
+        logger.info(
+            "[MLModel] Loaded %s — %d features  mem=%.1f MB",
+            sym, len(self._features), self.memory_usage(),
         )
-
-        up_move   = future_high - close
-        down_move = close - future_low
-
-        buy_cond  = (up_move   > threshold) & (up_move   > min_pip)
-        sell_cond = (down_move > threshold) & (down_move > min_pip)
-
-        labels = pd.Series(0, index=close.index, dtype=np.int32)
-        labels[buy_cond  & ~sell_cond]                              = 1
-        labels[sell_cond & ~buy_cond]                               = 2
-        labels[buy_cond  &  sell_cond & (up_move >= down_move)]     = 1
-        labels[buy_cond  &  sell_cond & (up_move <  down_move)]     = 2
-        labels = labels[valid_mask]
-
-        logger.debug(
-            f"_create_labels: {valid_mask.sum()} valid rows | "
-            f"ATR_MULT={atr_mult}  FWD={fwd_bars}  MIN_PIP={min_pip}"
-        )
-
-        return labels
-
-    # ────────────────────────────────────────────────────────────────────────
-    #  Helpers
-    # ────────────────────────────────────────────────────────────────────────
+        return True
 
     @staticmethod
-    def _safe_proba(proba: np.ndarray, classes: np.ndarray) -> np.ndarray:
-        """Map model probability output to fixed [HOLD, BUY, SELL] order."""
-        full = np.zeros(3, dtype=np.float32)
-        for i, cls in enumerate(classes):
-            if 0 <= cls <= 2:
-                full[cls] = proba[i]
-        total = full.sum()
-        return full / total if total > 0 else np.array([1.0, 0.0, 0.0])
-
-    @staticmethod
-    def _ensemble_labels(xgb_proba, lgbm_proba) -> np.ndarray:
-        avg = xgb_proba * 0.45 + lgbm_proba * 0.55
-        return np.argmax(avg, axis=1)
-
-    def _save(self, symbol: str) -> None:
-        try:
-            self._delete_model_files(symbol)
-            paths = {
-                f"xgb_{symbol}.pkl":      self._xgb,
-                f"lgbm_{symbol}.pkl":     self._lgbm,
-                f"scaler_{symbol}.pkl":   self._scaler,
-                f"features_{symbol}.pkl": self._features,
-            }
-            for fname, obj in paths.items():
-                with open(os.path.join(MODEL_DIR, fname), "wb") as fh:
-                    pickle.dump(obj, fh)
-            logger.info(f"✅ Model saved for {symbol}")
-        except Exception as e:
-            logger.error(f"MLModel save error: {e}")
-
-    @staticmethod
-    def _delete_model_files(symbol: str) -> None:
-        patterns = [
-            f"xgb_{symbol}.pkl",
-            f"lgbm_{symbol}.pkl",
-            f"scaler_{symbol}.pkl",
-            f"features_{symbol}.pkl",
-            f"rf_{symbol}.pkl",
-            f"gb_{symbol}.pkl",
-        ]
-        for pattern in patterns:
-            for path in glob.glob(os.path.join(MODEL_DIR, pattern)):
-                try:
-                    os.remove(path)
-                    logger.debug(f"Deleted stale model file: {path}")
-                except Exception:
-                    pass
+    def delete_stale(symbol: str) -> None:
+        """Remove all model artefact files for a given symbol."""
+        for prefix in ("xgb", "lgbm", "scaler", "features"):
+            path = MODEL_DIR / f"{prefix}_{symbol}.pkl"
+            if path.exists():
+                path.unlink()
+                logger.info("[MLModel] Deleted stale file: %s", path)

@@ -5,9 +5,7 @@ import pandas as pd
 import pytz
 from datetime import datetime, timedelta
 from typing import Optional
-from monitoring.logger import get_logger
-
-logger = get_logger("CalendarScanner")
+from monitoring.logger import logger
 
 
 class CalendarScanner:
@@ -26,6 +24,15 @@ class CalendarScanner:
         - UNKNOWN currency events are discarded (they can never block a
           known symbol and only add log noise).
         - Minimum title length check prevents very short feed entries.
+
+    GODBOT v3.0 UPDATES:
+        - CACHE_MINUTES reduced from 60 → 15 to match M5 scan cycle and
+          prevent stale cache missing a news event within the hour.
+        - Logger updated to use shared monitoring.logger instance directly,
+          consistent with all other updated GOD_BOT modules.
+        - minutes_before default now reads from CONFIG.NEWS_BLACKOUT_MINUTES
+          (default 30) so it can be tuned from settings.py without touching
+          this file.
     """
 
     RSS_FEEDS = {
@@ -201,7 +208,10 @@ class CalendarScanner:
     # Minimum title word count — rejects very short feed entries
     MIN_TITLE_WORDS = 4
 
-    CACHE_MINUTES = 60
+    # [FIX] Reduced from 60 → 15 minutes to match the M5 scan cycle.
+    # A 60-minute stale cache could miss a news event published within
+    # the hour, causing the bot to trade through high-impact releases.
+    CACHE_MINUTES = 15
 
     EVENT_TIME_OFFSET_HOURS = 1
 
@@ -245,10 +255,23 @@ class CalendarScanner:
     def is_safe_to_trade(
         self,
         symbol:         str,
-        minutes_before: int = 30,
+        minutes_before: int = None,
         minutes_after:  int = 15,
     ) -> dict:
-        """Return {'safe': bool, 'reason': str, 'events': list}."""
+        """
+        Return {'safe': bool, 'reason': str, 'events': list}.
+
+        minutes_before defaults to CONFIG.NEWS_BLACKOUT_MINUTES (30) so it
+        can be tuned from settings.py without touching this file.
+        """
+        # [FIX] Read blackout window from CONFIG with fallback to 30 minutes.
+        if minutes_before is None:
+            try:
+                from config.settings import CONFIG
+                minutes_before = int(getattr(CONFIG, "NEWS_BLACKOUT_MINUTES", 30))
+            except Exception:
+                minutes_before = 30
+
         try:
             events_df = self._get_rss_events()
             if events_df is None or events_df.empty:

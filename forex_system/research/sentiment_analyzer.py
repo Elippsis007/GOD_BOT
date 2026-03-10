@@ -4,9 +4,7 @@ import json
 import re
 import time
 from datetime import datetime
-from monitoring.logger import get_logger
-
-logger = get_logger("SentimentAnalyzer")
+from monitoring.logger import logger
 
 # ── RSS News Sources ──────────────────────────────────────────────────────────
 RSS_FEEDS = {
@@ -25,18 +23,35 @@ RSS_FEEDS = {
 # ── Currency-Specific Keywords ────────────────────────────────────────────────
 CURRENCY_KEYWORDS = {
     "EURUSD": ["euro", "EUR", "ECB", "lagarde", "european central bank",
-               "eurozone", "eur/usd", "eurodollar"],
+               "eurozone", "eur/usd", "eurodollar",
+               "dollar", "USD", "federal reserve", "fed", "fomc",
+               "gold", "XAU"],                          # gold added — USD-correlated
     "GBPUSD": ["pound", "GBP", "sterling", "bank of england", "BOE",
-               "bailey", "gbp/usd", "british economy"],
+               "bailey", "gbp/usd", "british economy",
+               "dollar", "USD"],
     "USDJPY": ["yen", "JPY", "bank of japan", "BOJ", "ueda", "boj",
-               "usd/jpy", "japanese yen"],
+               "usd/jpy", "japanese yen",
+               "dollar", "USD", "risk sentiment", "safe haven"],
     "AUDUSD": ["aussie", "AUD", "reserve bank australia", "RBA",
-               "aud/usd", "australian dollar", "iron ore"],
+               "aud/usd", "australian dollar", "iron ore",
+               "dollar", "USD"],
     "USDCAD": ["loonie", "CAD", "bank of canada", "BOC",
-               "usd/cad", "canadian dollar", "oil prices"],
+               "usd/cad", "canadian dollar", "oil prices",
+               "dollar", "USD"],
     "XAUUSD": ["gold", "XAU", "bullion", "xau/usd", "precious metals",
-               "gold price", "safe haven"],
+               "gold price", "safe haven",
+               "dollar", "USD", "real yield", "inflation"],
 }
+
+# ── Noise Filter ──────────────────────────────────────────────────────────────
+# Articles matching any of these are discarded before scoring.
+NOISE_KEYWORDS = [
+    "WTI", "crude oil", "Brent", "natural gas",
+    "bitcoin", "crypto", "ethereum",
+    "Middle East", "war", "attack", "military", "airstrike",
+    "earthquake", "hurricane", "flood",
+    "merger", "acquisition", "IPO", "earnings",
+]
 
 # Neutral fallback returned when all engines fail
 _NEUTRAL_RESULT = {
@@ -47,8 +62,9 @@ _NEUTRAL_RESULT = {
     "articles":   0,
 }
 
-# Cache TTL in seconds (30 minutes)
-CACHE_TTL_SECS = 1800
+# [FIX] Reduced from 1800 → 900 seconds (15 minutes) to match the M5 scan
+# cycle and stay consistent with calendar_scanner.py cache TTL.
+CACHE_TTL_SECS = 900
 
 # Minimum articles required before trusting a sentiment score
 MIN_ARTICLES = 3
@@ -60,13 +76,28 @@ class SentimentAnalyzer:
     Each symbol fetches articles using its OWN keywords only,
     preventing identical scores across all pairs.
 
-    Uses new google.genai package (replaces deprecated google.generativeai).
+    Fixes applied
+    ─────────────
+    • Removed blocking time.sleep() from Gemini retry loop.
+    • FinBERT pipeline loaded once at __init__ (not per call).
+    • Noise filter applied in _fetch_articles before scoring.
+    • "gold" and "silver" removed from noise — USD-correlated.
+    • CURRENCY_KEYWORDS extended with USD/counter-currency terms
+      so each symbol gets genuinely distinct article sets.
+
+    GODBOT v3.0 UPDATES:
+    • Logger updated to use shared monitoring.logger instance directly,
+      consistent with all other updated GOD_BOT modules.
+    • CACHE_TTL_SECS reduced from 1800 → 900 (15 min) to match M5 scan cycle.
+    • Gemini config reads from CONFIG object (CONFIG.GEMINI_ENABLED,
+      CONFIG.GEMINI_API_KEY) instead of direct module-level imports,
+      consistent with all other updated GOD_BOT modules.
     """
 
     def __init__(self):
-        self._gemini_client = None   # google.genai client instance
-        self._gemini_model  = None   # model name string
-        self._finbert_pipe  = None
+        self._gemini_client = None
+        self._gemini_model  = None
+        self._finbert_pipe  = None   # loaded once here, not per call
         self._vader         = None
         self._cache:        dict = {}
         self._cache_time:   dict = {}
@@ -77,27 +108,27 @@ class SentimentAnalyzer:
 
     def _load_gemini(self) -> None:
         try:
-            from config.settings import GEMINI_ENABLED, GEMINI_API_KEY
-            if not GEMINI_ENABLED:
+            # [FIX] Read from CONFIG object instead of direct module import
+            from config.settings import CONFIG
+            if not getattr(CONFIG, "GEMINI_ENABLED", False):
                 logger.info("Gemini disabled in settings — using FinBERT")
                 return
-            if not GEMINI_API_KEY or GEMINI_API_KEY == "PASTE_YOUR_GEMINI_KEY_HERE":
+            api_key = getattr(CONFIG, "GEMINI_API_KEY", "")
+            if not api_key or api_key == "PASTE_YOUR_GEMINI_KEY_HERE":
                 logger.info("Gemini key not set — using FinBERT")
                 return
 
-            # ── NEW: google.genai replaces deprecated google.generativeai ────
             try:
                 from google import genai
-                self._gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+                self._gemini_client = genai.Client(api_key=api_key)
                 self._gemini_model  = "gemini-2.0-flash"
                 logger.info(
                     "✅ Gemini loaded — contextual sentiment active "
                     "(~92% accuracy) [EURUSD only]"
                 )
             except ImportError:
-                # Fallback: try old package if new one not yet installed
                 import google.generativeai as genai_old
-                genai_old.configure(api_key=GEMINI_API_KEY)
+                genai_old.configure(api_key=api_key)
                 self._gemini_client = genai_old.GenerativeModel("gemini-2.0-flash")
                 self._gemini_model  = "legacy"
                 logger.info(
@@ -132,10 +163,16 @@ class SentimentAnalyzer:
 
     # ── Article Fetching ──────────────────────────────────────────────────────
 
+    def _is_noise(self, text: str) -> bool:
+        """Return True if the article matches a noise keyword and should be discarded."""
+        tl = text.lower()
+        return any(kw.lower() in tl for kw in NOISE_KEYWORDS)
+
     def _fetch_articles(self, symbol: str) -> list:
         """
         Fetch up to 20 articles for a symbol using ONLY that symbol's
-        keywords, sampling evenly across all feeds before hitting the cap.
+        keywords, applying the noise filter before accepting an article.
+        Sampling is round-robin across feeds before hitting the 20-article cap.
         """
         kw = CURRENCY_KEYWORDS.get(symbol, [])
         if not kw:
@@ -152,8 +189,14 @@ class SentimentAnalyzer:
                 for entry in feed.entries[:25]:
                     title   = entry.get("title", "")
                     summary = entry.get("summary", "")
-                    txt     = f"{title} {summary}".lower()
-                    if any(k.lower() in txt for k in kw):
+                    txt     = f"{title} {summary}"
+
+                    # Noise filter — discard before keyword check
+                    if self._is_noise(txt):
+                        logger.debug(f"[SA] Skipping noise: \"{title[:60]}\"")
+                        continue
+
+                    if any(k.lower() in txt.lower() for k in kw):
                         feed_articles.append({
                             "title":   title,
                             "summary": summary[:300],
@@ -208,7 +251,6 @@ class SentimentAnalyzer:
         )
 
         try:
-            # ── NEW google.genai API call ─────────────────────────────────────
             if self._gemini_model != "legacy":
                 from google import genai
                 response = self._gemini_client.models.generate_content(
@@ -217,7 +259,6 @@ class SentimentAnalyzer:
                 )
                 text = response.text
             else:
-                # Legacy fallback path for old google.generativeai package
                 resp = self._gemini_client.generate_content(prompt)
                 text = resp.text
 
@@ -316,7 +357,7 @@ class SentimentAnalyzer:
     # ── Main Public Method ────────────────────────────────────────────────────
 
     def get_symbol_sentiment(self, symbol: str) -> dict:
-        """Return sentiment dict for a symbol. Cached for 30 minutes."""
+        """Return sentiment dict for a symbol. Cached for 15 minutes."""
         now = datetime.now()
 
         if (

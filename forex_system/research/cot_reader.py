@@ -7,9 +7,7 @@ import numpy as np
 from io import BytesIO
 from datetime import datetime, timedelta
 from typing import Optional
-from monitoring.logger import get_logger
-
-logger = get_logger("COTReader")
+from monitoring.logger import logger
 
 
 class COTReader:
@@ -21,8 +19,6 @@ class COTReader:
     COT_URL   = "https://www.cftc.gov/files/dea/history/fut_fin_txt_{year}.zip"
     CACHE_DIR = "data/cot"
 
-    # FIX: reduced from 7 days to 2 days so fresh data is picked up within
-    # 2 days of the Tuesday CFTC release rather than up to 13 days late.
     UPDATE_THRESHOLD_DAYS = 2
 
     CURRENCY_MAP = {
@@ -40,7 +36,6 @@ class COTReader:
         os.makedirs(self.CACHE_DIR, exist_ok=True)
         self._data: Optional[pd.DataFrame] = None
 
-    # ── Should Update? ────────────────────────────────────────────────────────
     def should_update(self) -> bool:
         cache_file = os.path.join(self.CACHE_DIR, "cot_latest.csv")
         if not os.path.exists(cache_file):
@@ -49,13 +44,7 @@ class COTReader:
         age = datetime.now() - modified
         return age > timedelta(days=self.UPDATE_THRESHOLD_DAYS)
 
-    # ── Download ──────────────────────────────────────────────────────────────
     def download_cot_data(self) -> bool:
-        """
-        Download CFTC COT ZIP for the current year.
-        FIX: falls back to the previous year if the current year's file
-        is not yet published (common in early January).
-        """
         year = datetime.now().year
 
         for attempt_year in (year, year - 1):
@@ -64,7 +53,6 @@ class COTReader:
             try:
                 resp = requests.get(url, timeout=30)
 
-                # FIX: catch 404 explicitly and try previous year
                 if resp.status_code == 404:
                     logger.warning(
                         f"COT {attempt_year} file not found (404) — "
@@ -82,17 +70,17 @@ class COTReader:
                     with z.open(txt_files[0]) as f:
                         df = pd.read_csv(f, low_memory=False)
 
-                # Standardise date column
                 date_col = self._find_date_column(df)
                 if date_col:
                     df["report_date"] = pd.to_datetime(
                         df[date_col], errors="coerce"
                     )
                 else:
-                    logger.warning("COT: no date column found — report_date will be NaT")
+                    logger.warning(
+                        "COT: no date column found — report_date will be NaT"
+                    )
                     df["report_date"] = pd.NaT
 
-                # Sort ascending so iloc[-1] is always the most recent row
                 if "report_date" in df.columns:
                     df.sort_values("report_date", ascending=True, inplace=True)
                     df.reset_index(drop=True, inplace=True)
@@ -108,13 +96,11 @@ class COTReader:
 
             except Exception as e:
                 logger.error(f"COT download error ({attempt_year}): {e}")
-                # Don't break — let the loop try the previous year
                 continue
 
         logger.error("COT download failed for both current and previous year")
         return False
 
-    # ── Column Finders ────────────────────────────────────────────────────────
     def _find_date_column(self, df: pd.DataFrame) -> Optional[str]:
         candidates = [
             "Report_Date_as_YYYY-MM-DD",
@@ -151,7 +137,6 @@ class COTReader:
                 return col
         return None
 
-    # ── Load Cache ────────────────────────────────────────────────────────────
     def _load_data(self) -> bool:
         if self._data is not None:
             return True
@@ -161,8 +146,6 @@ class COTReader:
         try:
             self._data = pd.read_csv(cache_file, low_memory=False)
 
-            # Ensure ascending date order after loading from disk
-            # (in case the CSV was written by an older version of this code)
             date_col = self._find_date_column(self._data)
             if date_col:
                 self._data["report_date"] = pd.to_datetime(
@@ -180,7 +163,6 @@ class COTReader:
             logger.error(f"COT load error: {e}")
             return False
 
-    # ── Get Signal ────────────────────────────────────────────────────────────
     def get_cot_signal(self, symbol: str) -> dict:
         default = {
             "bias":         "Neutral",
@@ -203,13 +185,11 @@ class COTReader:
         try:
             df = self._data.copy()
 
-            # Find market name column
             name_col = self._find_name_column(df)
             if not name_col:
                 logger.error("COT: cannot find market name column")
                 return default
 
-            # Filter to this currency
             mask      = df[name_col].str.upper().str.contains(
                 market_name.upper(), na=False
             )
@@ -221,9 +201,6 @@ class COTReader:
                 )
                 return default
 
-            # FIX: search for long/short columns in market_df, not the full df
-            # (semantically correct — was using df which happened to work
-            # because column names are shared, but will break if refactored)
             long_col = self._find_column(market_df, [
                 "Lev_Money_Positions_Long_All",
                 "NonComm_Positions_Long_All",
@@ -242,7 +219,6 @@ class COTReader:
                 )
                 return default
 
-            # Numeric conversion and net position
             market_df[long_col]  = pd.to_numeric(
                 market_df[long_col],  errors="coerce"
             )
@@ -255,23 +231,15 @@ class COTReader:
             if market_df.empty:
                 return default
 
-            # The DataFrame is sorted ascending by date so iloc[-1] = most recent
-            # FIX: was iloc[-1] on unsorted data — read the oldest record instead
-            # of the latest. Data is now guaranteed sorted ascending in _load_data
-            # and download_cot_data so this is always the most recent report.
             latest_net = float(market_df["net"].iloc[-1])
             net_series = market_df["net"]
 
-            # FIX: exclude the latest value from the historical comparison series
-            # so the percentile rank is against *prior* history only, not itself.
-            # A reading at the true all-time extreme now correctly scores 100%.
             historical = net_series.iloc[:-1]
             if len(historical) == 0:
-                pct = 50.0   # only one data point — call it neutral
+                pct = 50.0
             else:
                 pct = float((historical < latest_net).mean() * 100)
 
-            # Bias and signal
             if pct >= 65:
                 bias, signal = "Bullish", "BUY"
             elif pct <= 35:
@@ -291,7 +259,6 @@ class COTReader:
             logger.error(f"COT signal error for {symbol}: {e}")
             return default
 
-    # ── Print Summary ─────────────────────────────────────────────────────────
     def print_cot_summary(self) -> None:
         from config.settings import CONFIG
 
