@@ -45,7 +45,7 @@
 #
 #  [O]  TP pip cap enforced after RR calculation — was dead code in repo.
 #
-#  [P]  REVERSAL_THRESHOLD = max(BULL_THRESHOLD - 1, 2) set dynamically.
+#  [P]  REVERSAL_THRESHOLD dynamic assignment (now replaced by Fix U).
 #
 #  [Q]  VWAP Filter 10 added. MAX_FILTERS raised from 9 to 10.
 #
@@ -54,6 +54,24 @@
 #  [S]  TradingSignal dataclass gains sl_pips and tp_pips fields.
 #         These are required by risk_manager.calculate_position() [Fix B]
 #         and main.py's order routing after the risk_manager interface change.
+#
+#  [T]  HTF EMA hard gate added to evaluate():
+#         htf_ema_bull / htf_ema_bear columns (forward-filled from M15 onto
+#         M5 bars by IndicatorEngine._add_htf_ema()) are now read as a hard
+#         gate AFTER score assembly but BEFORE TradingSignal construction.
+#         A BUY signal is blocked if htf_ema_bull == 0 (M15 trend bearish).
+#         A SELL signal is blocked if htf_ema_bear == 0 (M15 trend bullish).
+#         If neither column is present the gate is skipped (graceful degradation
+#         so the engine still works during backtests without HTF data).
+#
+#  [U]  REVERSAL_THRESHOLD raised to match BULL_THRESHOLD (was BULL - 1).
+#         With BULL_THRESHOLD = 3, the previous max(3-1, 2) = 2 meant the
+#         early reversal detector could fire on just Stochastic + RSI + CMF
+#         without any EMA, MACD, ADX, BB, or structure confirmation.
+#         At 2/10 filters that is statistically indistinguishable from noise.
+#         Setting REVERSAL_THRESHOLD = BULL_THRESHOLD requires the same
+#         confluence level for reversals as for normal signals, ensuring
+#         early entries only fire when the same quality bar is met.
 #
 # =============================================================================
 
@@ -79,11 +97,8 @@ class TradingSignal:
     """
     Fully-specified signal returned by SignalEngine.evaluate().
 
-    [S] sl_pips and tp_pips are added so that main.py can pass pip
-        distances to risk_manager.calculate_position() after the
-        interface change in risk_manager Fix [B]. Without these fields
-        main.py has to reverse-engineer pip distances from absolute
-        prices, which is error-prone and symbol-type-dependent.
+    [S] sl_pips and tp_pips added so main.py can pass pip distances
+        directly to risk_manager.calculate_position().
     """
     symbol:     str
     signal:     SignalType
@@ -119,27 +134,33 @@ class SignalEngine:
     8.  Volatility squeeze breakout
     9.  Price structure HH+HL or LH+LL (majority vote — Fix B)
     10. VWAP deviation (Fix Q)
+
+    HTF Gate [T]
+    ────────────
+    After filters 1–10 are scored and a direction is determined, the M15
+    EMA trend (htf_ema_bull / htf_ema_bear) is checked as a hard gate.
+    A signal that contradicts the higher-timeframe trend is blocked before
+    TradingSignal is constructed.
     """
 
     # ── Max filters ───────────────────────────────────────────────────────────
-    MAX_FILTERS: int = 10   # [Q] was 9 — VWAP adds Filter 10
+    MAX_FILTERS: int = 10
 
     # ── Fallback constants (M5 profile mirror) ────────────────────────────────
-    # [I] rsi_bear_low = 65 (was 60 — RSI 60–65 is normal trend momentum)
     _FALLBACK = {
         "adx_threshold":   35,
         "rsi_overbought":  75,
         "rsi_oversold":    25,
         "rsi_bull_low":    35,
         "rsi_bull_high":   60,
-        "rsi_bear_low":    65,   # [I]
+        "rsi_bear_low":    65,
         "rsi_bear_high":   75,
         "cmf_threshold":   0.05,
         "stoch_bull_zone": 25,
         "stoch_bear_zone": 75,
         "signal_score":    4,
         "sl_pips":         6.0,
-        "tp_pips":         10.0,
+        "tp_pips":         12.0,
     }
 
     # ── Price structure ───────────────────────────────────────────────────────
@@ -158,12 +179,12 @@ class SignalEngine:
     REVERSAL_RSI_SELL_HIGH: int = 70
 
     # ── Hard-block extremes [E][F] ────────────────────────────────────────────
-    RSI_HARD_BLOCK:       int = 90   # RSI ≥ 90  → -1 unconditional
-    STOCH_HARD_BLOCK:     int = 95   # K ≥ 95    → -1 unconditional
-    RSI_HARD_BLOCK_LOW:   int = 18   # RSI ≤ 18  → +1 unconditional
-    STOCH_HARD_BLOCK_LOW: int = 5    # K ≤ 5     → +1 unconditional
+    RSI_HARD_BLOCK:       int = 90
+    STOCH_HARD_BLOCK:     int = 95
+    RSI_HARD_BLOCK_LOW:   int = 18
+    STOCH_HARD_BLOCK_LOW: int = 5
 
-    # ── Strong trend ADX level [J] ────────────────────────────────────────────
+    # ── Strong trend ADX level [A][J] ─────────────────────────────────────────
     ADX_STRONG_TREND: int = 35
 
     # ── Candle body filter [K] ────────────────────────────────────────────────
@@ -180,15 +201,13 @@ class SignalEngine:
     def _update_thresholds(self) -> None:
         """
         Load all thresholds and pip caps from the active profile.
-        [P] Sets REVERSAL_THRESHOLD = max(BULL_THRESHOLD - 1, 2) dynamically.
+        [U] REVERSAL_THRESHOLD = BULL_THRESHOLD (was max(BULL-1, 2)).
         """
         if self.trading_style == "scalper":
             try:
                 p  = self.cfg.get_scalper_profile()
                 tf = p.get("tf_primary", 5)
-                logger.info(
-                    f"⚙️  SignalEngine loading scalper profile M{tf}"
-                )
+                logger.info(f"⚙️  SignalEngine loading scalper profile M{tf}")
             except Exception as exc:
                 logger.warning(
                     f"⚠️  Scalper profile load failed ({exc}); using fallback"
@@ -213,20 +232,20 @@ class SignalEngine:
 
         elif self.trading_style == "daytrader":
             try:
-                self.ADX_THRESHOLD   = getattr(self.cfg, "DAYTRADER_ADX_THRESHOLD",  25)
-                self.RSI_OVERBOUGHT  = getattr(self.cfg, "DAYTRADER_RSI_OVERBOUGHT",  70)
-                self.RSI_OVERSOLD    = getattr(self.cfg, "DAYTRADER_RSI_OVERSOLD",    30)
-                self.RSI_BULL_LOW    = getattr(self.cfg, "DAYTRADER_RSI_BULL_LOW",    40)
-                self.RSI_BULL_HIGH   = getattr(self.cfg, "DAYTRADER_RSI_BULL_HIGH",   60)
-                self.RSI_BEAR_LOW    = getattr(self.cfg, "DAYTRADER_RSI_BEAR_LOW",    65)
-                self.RSI_BEAR_HIGH   = getattr(self.cfg, "DAYTRADER_RSI_BEAR_HIGH",   70)
-                self.CMF_THRESHOLD   = getattr(self.cfg, "DAYTRADER_CMF_THRESHOLD",  0.05)
-                self.STOCH_BULL_ZONE = getattr(self.cfg, "DAYTRADER_STOCH_BULL_ZONE", 20)
-                self.STOCH_BEAR_ZONE = getattr(self.cfg, "DAYTRADER_STOCH_BEAR_ZONE", 80)
-                self.BULL_THRESHOLD  = getattr(self.cfg, "DAYTRADER_SIGNAL_SCORE",     4)
+                self.ADX_THRESHOLD   = getattr(self.cfg, "DAYTRADER_ADX_THRESHOLD",   25)
+                self.RSI_OVERBOUGHT  = getattr(self.cfg, "DAYTRADER_RSI_OVERBOUGHT",   70)
+                self.RSI_OVERSOLD    = getattr(self.cfg, "DAYTRADER_RSI_OVERSOLD",     30)
+                self.RSI_BULL_LOW    = getattr(self.cfg, "DAYTRADER_RSI_BULL_LOW",     40)
+                self.RSI_BULL_HIGH   = getattr(self.cfg, "DAYTRADER_RSI_BULL_HIGH",    60)
+                self.RSI_BEAR_LOW    = getattr(self.cfg, "DAYTRADER_RSI_BEAR_LOW",     65)
+                self.RSI_BEAR_HIGH   = getattr(self.cfg, "DAYTRADER_RSI_BEAR_HIGH",    70)
+                self.CMF_THRESHOLD   = getattr(self.cfg, "DAYTRADER_CMF_THRESHOLD",   0.05)
+                self.STOCH_BULL_ZONE = getattr(self.cfg, "DAYTRADER_STOCH_BULL_ZONE",  20)
+                self.STOCH_BEAR_ZONE = getattr(self.cfg, "DAYTRADER_STOCH_BEAR_ZONE",  80)
+                self.BULL_THRESHOLD  = getattr(self.cfg, "DAYTRADER_SIGNAL_SCORE",      4)
                 self.BEAR_THRESHOLD  = self.BULL_THRESHOLD
-                self.SL_PIPS         = getattr(self.cfg, "DAYTRADER_SL_PIPS",         15.0)
-                self.TP_PIPS         = getattr(self.cfg, "DAYTRADER_TP_PIPS",         30.0)
+                self.SL_PIPS         = getattr(self.cfg, "DAYTRADER_SL_PIPS",          15.0)
+                self.TP_PIPS         = getattr(self.cfg, "DAYTRADER_TP_PIPS",          30.0)
                 logger.info("⚙️  SignalEngine loaded day-trader profile")
             except Exception as exc:
                 logger.warning(
@@ -236,26 +255,27 @@ class SignalEngine:
         else:
             self._apply_fallback()
 
-        # [P] Dynamic reversal threshold — always one filter below normal
-        self.REVERSAL_THRESHOLD = max(self.BULL_THRESHOLD - 1, 2)
+        # [U] Reversal requires the same confluence as a normal signal
+        self.REVERSAL_THRESHOLD = self.BULL_THRESHOLD
 
     def _apply_fallback(self) -> None:
         fb = self._FALLBACK
-        self.ADX_THRESHOLD   = fb["adx_threshold"]
-        self.RSI_OVERBOUGHT  = fb["rsi_overbought"]
-        self.RSI_OVERSOLD    = fb["rsi_oversold"]
-        self.RSI_BULL_LOW    = fb["rsi_bull_low"]
-        self.RSI_BULL_HIGH   = fb["rsi_bull_high"]
-        self.RSI_BEAR_LOW    = fb["rsi_bear_low"]
-        self.RSI_BEAR_HIGH   = fb["rsi_bear_high"]
-        self.CMF_THRESHOLD   = fb["cmf_threshold"]
-        self.STOCH_BULL_ZONE = fb["stoch_bull_zone"]
-        self.STOCH_BEAR_ZONE = fb["stoch_bear_zone"]
-        self.BULL_THRESHOLD  = fb["signal_score"]
-        self.BEAR_THRESHOLD  = fb["signal_score"]
-        self.SL_PIPS         = fb["sl_pips"]
-        self.TP_PIPS         = fb["tp_pips"]
-        self.REVERSAL_THRESHOLD = max(self.BULL_THRESHOLD - 1, 2)   # [P]
+        self.ADX_THRESHOLD      = fb["adx_threshold"]
+        self.RSI_OVERBOUGHT     = fb["rsi_overbought"]
+        self.RSI_OVERSOLD       = fb["rsi_oversold"]
+        self.RSI_BULL_LOW       = fb["rsi_bull_low"]
+        self.RSI_BULL_HIGH      = fb["rsi_bull_high"]
+        self.RSI_BEAR_LOW       = fb["rsi_bear_low"]
+        self.RSI_BEAR_HIGH      = fb["rsi_bear_high"]
+        self.CMF_THRESHOLD      = fb["cmf_threshold"]
+        self.STOCH_BULL_ZONE    = fb["stoch_bull_zone"]
+        self.STOCH_BEAR_ZONE    = fb["stoch_bear_zone"]
+        self.BULL_THRESHOLD     = fb["signal_score"]
+        self.BEAR_THRESHOLD     = fb["signal_score"]
+        self.SL_PIPS            = fb["sl_pips"]
+        self.TP_PIPS            = fb["tp_pips"]
+        # [U] Reversal requires the same confluence as a normal signal
+        self.REVERSAL_THRESHOLD = self.BULL_THRESHOLD
         logger.warning("⚙️  SignalEngine using fallback thresholds")
 
     def reload_profile(self) -> None:
@@ -272,15 +292,6 @@ class SignalEngine:
     # ── Pip size helper [R] ───────────────────────────────────────────────────
     @staticmethod
     def _pip_size(symbol: str) -> float:
-        """
-        [R] Return the correct pip size for the symbol.
-        Fixes the original 'JPY or 0.0001' logic which gave XAUUSD 0.0001
-        (100× too small — a 6-pip SL became 0.0006 instead of $6.00).
-
-        JPY crosses:  0.01    (3-digit price, 1 pip = 0.01)
-        Metals:       1.0     (XAUUSD $2345 — 1 pip = $1.00)
-        Standard FX:  0.0001  (5-digit price, 1 pip = 0.0001)
-        """
         sym = symbol.upper()
         if "JPY" in sym:
             return 0.01
@@ -297,38 +308,22 @@ class SignalEngine:
         direction: str,
     ) -> tuple:
         """
-        Two-layer SL/TP with pip cap correctly enforced (Fix O).
-
-        Returns (sl_price, tp_price, sl_pips, tp_pips) — four values.
-
-        [S] sl_pips and tp_pips are returned so TradingSignal can store
-            them directly, enabling risk_manager.calculate_position() to
-            receive pip distances without reverse-engineering from prices.
-
-        [O] TP pip cap applied AFTER RR multiplication. Previously
-            tp_dist = min(atr_tp, cap_tp) was immediately overwritten by
-            tp_dist = sl_dist * RR_RATIO, making the cap dead code.
-
-        [R] Uses _pip_size(symbol) for correct metals / JPY handling.
+        Returns (sl_price, tp_price, sl_pips, tp_pips).
+        [O] TP cap applied AFTER RR multiplication — was dead code before.
+        [S] Returns sl_pips / tp_pips so TradingSignal stores them directly.
         """
         pip_size = self._pip_size(symbol)
 
-        # Layer 1 — ATR-adaptive
         atr_sl_dist = atr * 1.5
-        atr_tp_dist = atr_sl_dist * self.cfg.RR_RATIO
-
-        # Layer 2 — Pip caps from profile
         cap_sl_dist = self.SL_PIPS * pip_size
         cap_tp_dist = self.TP_PIPS * pip_size
 
-        # Final SL: tighter of ATR vs cap
         sl_dist = min(atr_sl_dist, cap_sl_dist)
 
-        # Final TP: RR from final SL, then capped independently [O]
+        # [O] cap enforced after RR — not before
         tp_dist = sl_dist * self.cfg.RR_RATIO
-        tp_dist = min(tp_dist, cap_tp_dist)   # [O] cap enforced here
+        tp_dist = min(tp_dist, cap_tp_dist)
 
-        # Convert to pips for TradingSignal [S]
         sl_pips = round(sl_dist / pip_size, 1)
         tp_pips = round(tp_dist / pip_size, 1)
 
@@ -344,14 +339,11 @@ class SignalEngine:
         logger.debug(
             f"_calc_sl_tp [{direction}] {symbol} | "
             f"entry={entry:.5f}  ATR={atr:.5f} | "
-            f"atr_sl={atr_sl_dist:.5f}  cap_sl={cap_sl_dist:.5f} "
-            f"→ sl_dist={sl_dist:.5f} ({sl_pips:.1f}p) | "
-            f"atr_tp={atr_tp_dist:.5f}  cap_tp={cap_tp_dist:.5f} "
-            f"→ tp_dist={tp_dist:.5f} ({tp_pips:.1f}p) | "
-            f"eff_RR={effective_rr:.2f} | "
-            f"SL={sl:.5f}  TP={tp:.5f}"
+            f"sl_dist={sl_dist:.5f} ({sl_pips:.1f}p) | "
+            f"tp_dist={tp_dist:.5f} ({tp_pips:.1f}p) | "
+            f"eff_RR={effective_rr:.2f} | SL={sl:.5f}  TP={tp:.5f}"
         )
-        return sl, tp, sl_pips, tp_pips   # [S] four values returned
+        return sl, tp, sl_pips, tp_pips
 
     # ── ADX strong trend [A][J] ───────────────────────────────────────────────
     def _strong_trend(
@@ -359,14 +351,6 @@ class SignalEngine:
         adx:      Optional[float],
         prev_adx: Optional[float],
     ) -> bool:
-        """
-        [A][J] True when trend is strong enough to neutralise OB/OS readings.
-
-        Condition 1: ADX ≥ ADX_STRONG_TREND (35) — sustained trend, even flat.
-        Condition 2: ADX > ADX_THRESHOLD AND rising — accelerating trend.
-
-        Fix J: condition 1 was missing — ADX=48 flat did not trigger override.
-        """
         if adx is None or prev_adx is None:
             return False
         if adx >= self.ADX_STRONG_TREND:
@@ -375,11 +359,6 @@ class SignalEngine:
 
     # ── Candle body filter [K] ────────────────────────────────────────────────
     def _candle_body_ok(self, last: pd.Series) -> tuple:
-        """
-        Returns (True, ratio) for directional candles.
-        Returns (False, ratio) for doji / spinning top / indecision.
-        [K] Threshold: body / range ≥ CANDLE_BODY_MIN_RATIO (0.45).
-        """
         try:
             high  = float(last.get("high",  0.0))
             low   = float(last.get("low",   0.0))
@@ -391,14 +370,10 @@ class SignalEngine:
             ratio = abs(close - open_) / rng
             return ratio >= self.CANDLE_BODY_MIN_RATIO, round(ratio, 3)
         except Exception:
-            return True, 1.0   # Cannot compute → do not block
+            return True, 1.0
 
     # ── Price structure — majority vote [B] ───────────────────────────────────
     def _price_structure(self, df: pd.DataFrame) -> int:
-        """
-        [B] Returns +1 (HH+HL majority), -1 (LH+LL majority), or 0.
-        ≥ STRUCTURE_MAJORITY (66%) of consecutive candle pairs must confirm.
-        """
         try:
             window = df.iloc[-(self.STRUCTURE_LOOKBACK + 1):-1]
             if len(window) < self.STRUCTURE_LOOKBACK:
@@ -434,14 +409,9 @@ class SignalEngine:
         prev_stoch_k: Optional[float],
         prev_stoch_d: Optional[float],
     ) -> tuple:
-        """
-        [D] Three-indicator early-entry detector.
-        [H] Confidence = REVERSAL_THRESHOLD / MAX_FILTERS (score-based, not synthetic).
-        """
         if None in (rsi, stoch_k, stoch_d, cmf, prev_stoch_k, prev_stoch_d):
             return None, []
 
-        # BUY reversal
         if (stoch_k < self.REVERSAL_STOCH_MAX and stoch_k > prev_stoch_k and
                 self.REVERSAL_RSI_LOW < rsi < self.REVERSAL_RSI_HIGH and
                 cmf > 0):
@@ -453,7 +423,6 @@ class SignalEngine:
                 "⚠️  EMA/MACD/ADX still lagging — tighter SL advised",
             ]
 
-        # SELL reversal
         if (stoch_k > self.REVERSAL_STOCH_MIN and stoch_k < prev_stoch_k and
                 self.REVERSAL_RSI_SELL_LOW < rsi < self.REVERSAL_RSI_SELL_HIGH and
                 cmf < 0):
@@ -466,6 +435,64 @@ class SignalEngine:
             ]
 
         return None, []
+
+    # ── HTF EMA hard gate [T] ─────────────────────────────────────────────────
+    def _htf_gate(
+        self,
+        last:        pd.Series,
+        signal_type: SignalType,
+        symbol:      str,
+    ) -> bool:
+        """
+        [T] Hard gate on M15 EMA trend confirmation.
+
+        Returns True  → signal passes (proceed to TradingSignal).
+        Returns False → signal blocked (return None from evaluate()).
+
+        htf_ema_bull = 1  →  M15 fast EMA > slow EMA (bullish trend).
+        htf_ema_bear = 1  →  M15 fast EMA < slow EMA (bearish trend).
+
+        Columns are forward-filled from M15 onto M5 by
+        IndicatorEngine._add_htf_ema(). If absent the gate is skipped
+        so the engine degrades gracefully during backtests.
+        """
+        htf_bull = last.get("htf_ema_bull", None)
+        htf_bear = last.get("htf_ema_bear", None)
+
+        if htf_bull is None and htf_bear is None:
+            logger.debug(
+                f"⚠️  [{symbol}] HTF gate skipped — "
+                f"htf_ema_bull/bear not present"
+            )
+            return True
+
+        if signal_type == SignalType.BUY:
+            if (htf_bull is not None and
+                    not np.isnan(float(htf_bull)) and
+                    float(htf_bull) == 0):
+                logger.info(
+                    f"⛔ [{symbol}] HTF gate BLOCKED BUY — "
+                    f"M15 EMA trend is BEARISH (htf_ema_bull=0)"
+                )
+                return False
+            logger.debug(
+                f"✅ [{symbol}] HTF gate passed BUY — htf_ema_bull={htf_bull}"
+            )
+
+        elif signal_type == SignalType.SELL:
+            if (htf_bear is not None and
+                    not np.isnan(float(htf_bear)) and
+                    float(htf_bear) == 0):
+                logger.info(
+                    f"⛔ [{symbol}] HTF gate BLOCKED SELL — "
+                    f"M15 EMA trend is BULLISH (htf_ema_bear=0)"
+                )
+                return False
+            logger.debug(
+                f"✅ [{symbol}] HTF gate passed SELL — htf_ema_bear={htf_bear}"
+            )
+
+        return True
 
     # ── Main evaluation ───────────────────────────────────────────────────────
     def evaluate(
@@ -482,7 +509,7 @@ class SignalEngine:
         score = 0
         reasons: list = []
 
-        # ── Pre-fetch ADX — used by multiple filters ───────────────────────
+        # ── Pre-fetch ADX ──────────────────────────────────────────────────
         adx      = last.get("adx",    None)
         prev_adx = prev.get("adx",    None)
         di_pos   = last.get("di_pos", None)
@@ -546,7 +573,7 @@ class SignalEngine:
         # ── Filter 3: RSI Zone [L][E][F][A] ───────────────────────────────
         rsi = last.get("rsi", None)
         if rsi is not None:
-            if rsi <= self.RSI_HARD_BLOCK_LOW:                          # [F]
+            if rsi <= self.RSI_HARD_BLOCK_LOW:
                 score += 1
                 reasons.append(
                     f"✅ RSI extreme oversold ({rsi:.1f} ≤ "
@@ -557,7 +584,7 @@ class SignalEngine:
                 reasons.append(
                     f"✅ RSI oversold ({rsi:.1f} ≤ {self.RSI_OVERSOLD})"
                 )
-            elif self.RSI_OVERSOLD < rsi < self.RSI_BULL_LOW:          # [L]
+            elif self.RSI_OVERSOLD < rsi < self.RSI_BULL_LOW:
                 reasons.append(
                     f"⚪ RSI recovery zone ({rsi:.1f}) — neutral "
                     f"[{self.RSI_OVERSOLD}–{self.RSI_BULL_LOW}]"
@@ -570,17 +597,17 @@ class SignalEngine:
                 )
             elif self.RSI_BULL_HIGH <= rsi < self.RSI_BEAR_LOW:
                 reasons.append(
-                    f"⚪ RSI neutral zone ({rsi:.1f}) — "
+                    f"⚪ RSI neutral zone ({rsi:.1f}) "
                     f"[{self.RSI_BULL_HIGH}–{self.RSI_BEAR_LOW}]"
                 )
-            elif rsi >= self.RSI_HARD_BLOCK:                           # [E]
+            elif rsi >= self.RSI_HARD_BLOCK:
                 score -= 1
                 reasons.append(
                     f"❌ RSI extreme overbought ({rsi:.1f} ≥ "
                     f"{self.RSI_HARD_BLOCK}) — hard block"
                 )
             elif rsi >= self.RSI_OVERBOUGHT:
-                if bull_trend_di:                                       # [A]
+                if bull_trend_di:
                     reasons.append(
                         f"⚠️  RSI OB ({rsi:.1f}) — ADX={adx:.1f} "
                         f"strong uptrend → neutralised"
@@ -591,7 +618,7 @@ class SignalEngine:
                         f"❌ RSI overbought ({rsi:.1f} ≥ {self.RSI_OVERBOUGHT})"
                     )
             elif self.RSI_BEAR_LOW <= rsi < self.RSI_OVERBOUGHT:
-                if bull_trend_di:                                       # [A]
+                if bull_trend_di:
                     reasons.append(
                         f"⚠️  RSI bear zone ({rsi:.1f}) — ADX={adx:.1f} "
                         f"uptrend → neutralised"
@@ -610,16 +637,16 @@ class SignalEngine:
         bb_lower = last.get("bb_lower", None)
 
         if None not in (close, bb_mid, bb_upper, bb_lower):
-            adx_ok = adx is not None and adx >= self.ADX_THRESHOLD
+            adx_ok  = adx is not None and adx >= self.ADX_THRESHOLD
+            adx_str = f"{adx:.1f}" if adx is not None else "N/A"
             if close >= bb_upper:
-                if adx_ok:                                             # [M]
+                if adx_ok:
                     score += 1
                     reasons.append(
                         f"✅ Price ≥ BB upper — trend continuation "
-                        f"(ADX={adx:.1f})"
+                        f"(ADX={adx_str})"
                     )
                 else:
-                    adx_str = f"{adx:.1f}" if adx is not None else "N/A"
                     reasons.append(
                         f"⚪ Price ≥ BB upper — ranging (ADX={adx_str}) → neutral"
                     )
@@ -630,14 +657,13 @@ class SignalEngine:
                 score -= 1
                 reasons.append("❌ Price below BB midline — bearish side")
             elif close <= bb_lower:
-                if adx_ok:                                             # [M]
+                if adx_ok:
                     score -= 1
                     reasons.append(
                         f"❌ Price ≤ BB lower — trend continuation "
-                        f"(ADX={adx:.1f})"
+                        f"(ADX={adx_str})"
                     )
                 else:
-                    adx_str = f"{adx:.1f}" if adx is not None else "N/A"
                     reasons.append(
                         f"⚪ Price ≤ BB lower — ranging (ADX={adx_str}) → neutral"
                     )
@@ -669,7 +695,7 @@ class SignalEngine:
         prev_stoch_d = prev.get("stoch_d", None)
 
         if None not in (stoch_k, stoch_d):
-            if stoch_k <= self.STOCH_HARD_BLOCK_LOW:                   # [F]
+            if stoch_k <= self.STOCH_HARD_BLOCK_LOW:
                 score += 1
                 reasons.append(
                     f"✅ Stoch extreme oversold ({stoch_k:.1f} ≤ "
@@ -680,14 +706,14 @@ class SignalEngine:
                 reasons.append(
                     f"✅ Stoch oversold ({stoch_k:.1f} ≤ {self.STOCH_BULL_ZONE})"
                 )
-            elif stoch_k >= self.STOCH_HARD_BLOCK:                     # [E]
+            elif stoch_k >= self.STOCH_HARD_BLOCK:
                 score -= 1
                 reasons.append(
                     f"❌ Stoch extreme OB ({stoch_k:.1f} ≥ "
                     f"{self.STOCH_HARD_BLOCK}) — hard block"
                 )
             elif stoch_k >= self.STOCH_BEAR_ZONE:
-                if bull_trend_di:                                       # [A]
+                if bull_trend_di:
                     reasons.append(
                         f"⚠️  Stoch OB ({stoch_k:.1f}) — ADX={adx:.1f} "
                         f"uptrend → neutralised"
@@ -697,13 +723,13 @@ class SignalEngine:
                     reasons.append(
                         f"❌ Stoch OB ({stoch_k:.1f} ≥ {self.STOCH_BEAR_ZONE})"
                     )
-            elif stoch_k > stoch_d and stoch_k < 50:                   # [N]
+            elif stoch_k > stoch_d and stoch_k < 50:
                 score += 1
                 reasons.append(
                     f"✅ Stoch bullish crossup ({stoch_k:.1f} > "
                     f"{stoch_d:.1f}) in lower half (<50)"
                 )
-            elif stoch_k < stoch_d and stoch_k > 50:                   # [N]
+            elif stoch_k < stoch_d and stoch_k > 50:
                 score -= 1
                 reasons.append(
                     f"❌ Stoch bearish crossdown ({stoch_k:.1f} < "
@@ -729,7 +755,7 @@ class SignalEngine:
                 )
             else:
                 reasons.append(
-                    f"⚪ CMF={cmf:.3f} — within ±{self.CMF_THRESHOLD}, neutral"
+                    f"⚪ CMF={cmf:.3f} within ±{self.CMF_THRESHOLD} — neutral"
                 )
 
         # ── Filter 8: Volatility Squeeze Breakout ─────────────────────────
@@ -790,29 +816,23 @@ class SignalEngine:
                             f"❌ Price below VWAP ({close:.5f} < {vwap_f:.5f})"
                         )
                     else:
-                        reasons.append(f"⚪ Price at VWAP ({vwap_f:.5f}) — neutral")
+                        reasons.append(
+                            f"⚪ Price at VWAP ({vwap_f:.5f}) — neutral"
+                        )
             except (ValueError, TypeError):
                 pass
 
-        # ── Fix C: MACD Veto ──────────────────────────────────────────────
+        # ── MACD Veto [C] ─────────────────────────────────────────────────
         eff_bull = self.BULL_THRESHOLD
         eff_bear = self.BEAR_THRESHOLD
 
         if self.MACD_VETO_INCREMENT > 0:
             if score > 0 and macd_score == -1:
                 eff_bull += self.MACD_VETO_INCREMENT
-                logger.debug(
-                    f"⚠️  [{symbol}] MACD veto — bull threshold "
-                    f"{self.BULL_THRESHOLD} → {eff_bull}"
-                )
             elif score < 0 and macd_score == 1:
                 eff_bear += self.MACD_VETO_INCREMENT
-                logger.debug(
-                    f"⚠️  [{symbol}] MACD veto — bear threshold "
-                    f"{self.BEAR_THRESHOLD} → {eff_bear}"
-                )
 
-        # ── Fix D: Early Reversal Detector ────────────────────────────────
+        # ── Early Reversal Detector [D] ───────────────────────────────────
         rev_direction = None
         rev_reasons   = []
 
@@ -824,94 +844,54 @@ class SignalEngine:
                 rsi=rsi, stoch_k=stoch_k, stoch_d=stoch_d,
                 cmf=cmf, prev_stoch_k=prev_stoch_k, prev_stoch_d=prev_stoch_d,
             )
-            if rev_direction:
-                logger.debug(
-                    f"🔄 [{symbol}] Reversal detector: {rev_direction} | "
-                    f"score={score} (need ±{self.BULL_THRESHOLD}) | "
-                    f"K={stoch_k:.1f} prev={prev_stoch_k:.1f} | "
-                    f"RSI={rsi:.1f} | CMF={cmf:.3f}"
-                )
 
-        # ── Fix K: Candle body filter ──────────────────────────────────────
+        # ── Candle body filter [K] ─────────────────────────────────────────
         would_fire = normal_bull or normal_bear or (rev_direction is not None)
 
         if would_fire:
             body_ok, body_ratio = self._candle_body_ok(last)
             if not body_ok:
-                dir_str = (
-                    "BUY" if (normal_bull or rev_direction == "BUY") else "SELL"
-                )
                 logger.debug(
                     f"⛔ [{symbol}] Candle body filter BLOCKED | "
-                    f"ratio={body_ratio:.3f} < {self.CANDLE_BODY_MIN_RATIO} | "
-                    f"score={score} would have fired {dir_str}"
+                    f"ratio={body_ratio:.3f} < {self.CANDLE_BODY_MIN_RATIO}"
                 )
                 return None
-            logger.debug(
-                f"✅ [{symbol}] Candle body OK | ratio={body_ratio:.3f}"
-            )
 
-        # ── Fix G: None-safe ADX log ──────────────────────────────────────
+        # ── None-safe ADX debug log [G] ───────────────────────────────────
         adx_str      = f"{adx:.1f}"      if adx      is not None else "None"
         prev_adx_str = f"{prev_adx:.1f}" if prev_adx is not None else "None"
 
         logger.debug(
-            f"📊 {symbol} | score={score} (±{self.BULL_THRESHOLD}"
-            + (f", eff_bull={eff_bull}" if eff_bull != self.BULL_THRESHOLD else "")
-            + (f", eff_bear={eff_bear}" if eff_bear != self.BEAR_THRESHOLD else "")
-            + f") | ADX={adx_str}/{prev_adx_str} strong={strong_trend} | "
-            f"reversal={rev_direction} | "
-            f"style={self.trading_style} TF=M{getattr(self.cfg,'SCALPER_TF_SELECTED','?')}"
+            f"📊 {symbol} | score={score} (±{self.BULL_THRESHOLD}) | "
+            f"ADX={adx_str}/{prev_adx_str} strong={strong_trend} | "
+            f"reversal={rev_direction}"
         )
 
-        # ── Final signal assembly ──────────────────────────────────────────
-        atr_val = float(last.get("atr",   0.0001))
-        entry   = float(last.get("close", 0.0))
-
+        # ── Determine signal direction ─────────────────────────────────────
         if normal_bull:
-            sl, tp, sl_pips, tp_pips = self._calc_sl_tp(  # [S]
-                entry, atr_val, symbol, "BUY"
-            )
             signal_type   = SignalType.BUY
-            strength      = abs(score)  / self.MAX_FILTERS
-            confidence    = round(min(score / self.MAX_FILTERS, 1.0), 3)
             final_reasons = reasons
             display_score = score
             display_thr   = eff_bull
-
+            is_reversal   = False
         elif normal_bear:
-            sl, tp, sl_pips, tp_pips = self._calc_sl_tp(  # [S]
-                entry, atr_val, symbol, "SELL"
-            )
             signal_type   = SignalType.SELL
-            strength      = abs(score)  / self.MAX_FILTERS
-            confidence    = round(min(abs(score) / self.MAX_FILTERS, 1.0), 3)
             final_reasons = reasons
             display_score = score
             display_thr   = eff_bear
-
+            is_reversal   = False
         elif rev_direction == "BUY":
-            sl, tp, sl_pips, tp_pips = self._calc_sl_tp(  # [S]
-                entry, atr_val, symbol, "BUY"
-            )
             signal_type   = SignalType.BUY
-            strength      = self.REVERSAL_THRESHOLD / self.MAX_FILTERS
-            confidence    = round(self.REVERSAL_THRESHOLD / self.MAX_FILTERS, 3)  # [H]
             final_reasons = rev_reasons + ["── Filter breakdown ──"] + reasons
             display_score = self.REVERSAL_THRESHOLD
             display_thr   = eff_bull
-
+            is_reversal   = True
         elif rev_direction == "SELL":
-            sl, tp, sl_pips, tp_pips = self._calc_sl_tp(  # [S]
-                entry, atr_val, symbol, "SELL"
-            )
             signal_type   = SignalType.SELL
-            strength      = self.REVERSAL_THRESHOLD / self.MAX_FILTERS
-            confidence    = round(self.REVERSAL_THRESHOLD / self.MAX_FILTERS, 3)  # [H]
             final_reasons = rev_reasons + ["── Filter breakdown ──"] + reasons
             display_score = self.REVERSAL_THRESHOLD
             display_thr   = eff_bear
-
+            is_reversal   = True
         else:
             logger.debug(
                 f"⛔ Gate 2 BLOCKED — {symbol} | score={score} "
@@ -920,6 +900,27 @@ class SignalEngine:
             )
             return None
 
+        # ── [T] HTF EMA hard gate ──────────────────────────────────────────
+        if not self._htf_gate(last, signal_type, symbol):
+            return None
+
+        # ── SL/TP calculation ──────────────────────────────────────────────
+        atr_val = float(last.get("atr",   0.0001))
+        entry   = float(last.get("close", 0.0))
+
+        sl, tp, sl_pips, tp_pips = self._calc_sl_tp(
+            entry, atr_val, symbol, signal_type.value
+        )
+
+        # ── Confidence ────────────────────────────────────────────────────
+        if is_reversal:
+            strength   = self.REVERSAL_THRESHOLD / self.MAX_FILTERS
+            confidence = round(self.REVERSAL_THRESHOLD / self.MAX_FILTERS, 3)
+        else:
+            strength   = abs(score) / self.MAX_FILTERS
+            confidence = round(min(abs(score) / self.MAX_FILTERS, 1.0), 3)
+
+        # ── Assemble signal ────────────────────────────────────────────────
         signal = TradingSignal(
             symbol     = symbol,
             signal     = signal_type,
@@ -928,8 +929,8 @@ class SignalEngine:
             entry      = round(entry, 5),
             sl         = sl,
             tp         = tp,
-            sl_pips    = sl_pips,    # [S]
-            tp_pips    = tp_pips,    # [S]
+            sl_pips    = sl_pips,
+            tp_pips    = tp_pips,
             atr        = round(atr_val, 5),
             reasons    = final_reasons,
             timestamp  = str(df.index[-1]),
@@ -944,6 +945,6 @@ class SignalEngine:
             f"ATR={atr_val:.5f} | "
             f"Style={self.trading_style} "
             f"TF=M{getattr(self.cfg, 'SCALPER_TF_SELECTED', '?')}"
-            + (" | 🔄 REVERSAL" if rev_direction else "")
+            + (" | 🔄 REVERSAL" if is_reversal else "")
         )
         return signal

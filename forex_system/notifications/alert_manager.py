@@ -301,7 +301,8 @@ class AlertManager:
         try:
             # Fix U – signal_type is a plain string ("BUY"/"SELL"/"HOLD"),
             # not an Enum. Calling .name on a string raises AttributeError.
-            direction = str(signal.signal_type).upper()
+            raw = getattr(signal, "signal", None) or getattr(signal, "signal_type", "HOLD")
+            direction = raw.value if hasattr(raw, "value") else str(raw).upper()
 
             entry      = float(signal.entry)
             sl         = float(position_spec.sl)

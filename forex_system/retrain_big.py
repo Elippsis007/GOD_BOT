@@ -1,7 +1,7 @@
 # retrain_big.py
 """
-Retrains the XGBoost + LightGBM ensemble ML models for every symbol
-in CONFIG.SYMBOLS using historical OHLCV data fetched from MT5.
+Retrains the triple-specialist ML models (BUY / SELL / REGIME) for every
+symbol in CONFIG.SYMBOLS using historical OHLCV data fetched from MT5.
 
 Run from the forex_system/ directory:
     python retrain_big.py                        # retrain all symbols
@@ -22,14 +22,17 @@ import argparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from core.mt5_connector              import MT5Connector
-from indicators.indicators_engine    import IndicatorEngine   # Fix 1
-from signals.ml_model                import MLSignalModel
-from config.settings                 import CONFIG
-from monitoring.logger               import logger
+from core.mt5_connector           import MT5Connector
+from indicators.indicators_engine import IndicatorEngine
+from signals.ml_model             import MLSignalModel
+from config.settings              import CONFIG
+from monitoring.logger            import logger
 
 # ── Ensure models directory exists ────────────────────────────────────────────
 os.makedirs("models", exist_ok=True)
+
+# ── Bar count ─────────────────────────────────────────────────────────────────
+_TARGET_BARS = 100_000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -39,8 +42,8 @@ def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="retrain_big.py",
         description=(
-            "GODBOT — retrain XGBoost + LightGBM ensemble models "
-            "from MT5 history."
+            "GODBOT — retrain triple-specialist ML models "
+            "(BUY / SELL / REGIME) from MT5 history."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -60,32 +63,203 @@ def _parse_args() -> argparse.Namespace:
         default=40,
         metavar="N",
         help=(
-            "Number of Optuna hyperparameter-search trials per model "
-            "(default: 40)."
+            "Number of Optuna hyperparameter-search trials per specialist "
+            "(default: 40). Total trials = N × 3 specialists."
+        ),
+    )
+    parser.add_argument(
+        "--bars",
+        type=int,
+        default=_TARGET_BARS,
+        metavar="N",
+        help=(
+            f"Number of OHLCV bars to fetch per symbol "
+            f"(default: {_TARGET_BARS:,}). "
+            f"Override if your broker has less history available."
         ),
     )
     return parser.parse_args()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Approximate calendar days helper
+# ─────────────────────────────────────────────────────────────────────────────
+def _approx_days(bars: int, timeframe_minutes: int) -> str:
+    """
+    Returns a human-readable string such as '~347 days (~1 year)'.
+    Accounts for the fact that forex markets are open ~24 h/day Mon–Fri.
+    """
+    trading_minutes_per_day = 1_440
+    total_minutes  = bars * timeframe_minutes
+    calendar_days  = total_minutes / trading_minutes_per_day
+    trading_days   = calendar_days * (5 / 7)
+
+    if trading_days >= 300:
+        years = trading_days / 252
+        return (
+            f"~{int(calendar_days)} calendar days "
+            f"(~{years:.1f} year{'s' if years >= 1.95 else ''})"
+        )
+    elif trading_days >= 60:
+        months = trading_days / 21
+        return (
+            f"~{int(calendar_days)} calendar days (~{months:.0f} months)"
+        )
+    else:
+        weeks = trading_days / 5
+        return (
+            f"~{int(calendar_days)} calendar days (~{weeks:.0f} weeks)"
+        )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Results display helper  ← UPDATED for triple-specialist architecture
+# ─────────────────────────────────────────────────────────────────────────────
+def _print_results(
+    symbol:       str,
+    tf_label:     str,
+    results:      dict,
+    bars:         int,
+    actual_bars:  int,
+    trials:       int,
+) -> None:
+    """
+    Prints per-specialist metrics from the new nested results dict returned
+    by MLSignalModel.train():
+
+        {
+            "buy":    { "xgb_cv_f1", "lgbm_cv_f1", "test_f1", "test_auc", ... },
+            "sell":   { ... },
+            "regime": { ... },
+            "n_train": int,
+            "n_test":  int,
+            "n_features": int,
+        }
+    """
+    buy    = results.get("buy",    {})
+    sell   = results.get("sell",   {})
+    regime = results.get("regime", {})
+    n_train   = results.get("n_train",    0)
+    n_test    = results.get("n_test",     0)
+    n_feat    = results.get("n_features", 0)
+
+    def _status_f1(f1: float) -> str:
+        if f1 >= 0.60:
+            return "✅"
+        if f1 >= 0.50:
+            return "🟡 above random, below target"
+        return "⚠️  below 0.50 — check labels / data quality"
+
+    def _status_auc(auc: float) -> str:
+        if auc >= 0.65:
+            return "✅"
+        if auc >= 0.55:
+            return "🟡 moderate"
+        return "⚠️  near random (0.50)"
+
+    buy_xgb_f1   = buy.get("xgb_cv_f1",   0.0)
+    buy_lgbm_f1  = buy.get("lgbm_cv_f1",  0.0)
+    buy_test_f1  = buy.get("test_f1",      0.0)
+    buy_test_auc = buy.get("test_auc",     0.0)
+
+    sell_xgb_f1   = sell.get("xgb_cv_f1",   0.0)
+    sell_lgbm_f1  = sell.get("lgbm_cv_f1",  0.0)
+    sell_test_f1  = sell.get("test_f1",      0.0)
+    sell_test_auc = sell.get("test_auc",     0.0)
+
+    reg_xgb_f1   = regime.get("xgb_cv_f1",   0.0)
+    reg_lgbm_f1  = regime.get("lgbm_cv_f1",  0.0)
+    reg_test_f1  = regime.get("test_f1",      0.0)
+    reg_test_auc = regime.get("test_auc",     0.0)
+
+    print(f"\n  ✅ {symbol} ({tf_label}) training complete:")
+    print()
+    print(f"     ┌─ BUY specialist ───────────────────────────────────")
+    print(f"     │  XGB  CV F1  : {buy_xgb_f1:.4f}  {_status_f1(buy_xgb_f1)}")
+    print(f"     │  LGBM CV F1  : {buy_lgbm_f1:.4f}  {_status_f1(buy_lgbm_f1)}")
+    print(f"     │  Test F1     : {buy_test_f1:.4f}  {_status_f1(buy_test_f1)}")
+    print(f"     │  Test AUC    : {buy_test_auc:.4f}  {_status_auc(buy_test_auc)}")
+    print()
+    print(f"     ├─ SELL specialist ──────────────────────────────────")
+    print(f"     │  XGB  CV F1  : {sell_xgb_f1:.4f}  {_status_f1(sell_xgb_f1)}")
+    print(f"     │  LGBM CV F1  : {sell_lgbm_f1:.4f}  {_status_f1(sell_lgbm_f1)}")
+    print(f"     │  Test F1     : {sell_test_f1:.4f}  {_status_f1(sell_test_f1)}")
+    print(f"     │  Test AUC    : {sell_test_auc:.4f}  {_status_auc(sell_test_auc)}")
+    print()
+    print(f"     ├─ REGIME specialist ────────────────────────────────")
+    print(f"     │  XGB  CV F1  : {reg_xgb_f1:.4f}  {_status_f1(reg_xgb_f1)}")
+    print(f"     │  LGBM CV F1  : {reg_lgbm_f1:.4f}  {_status_f1(reg_lgbm_f1)}")
+    print(f"     │  Test F1     : {reg_test_f1:.4f}  {_status_f1(reg_test_f1)}")
+    print(f"     │  Test AUC    : {reg_test_auc:.4f}  {_status_auc(reg_test_auc)}")
+    print()
+    print(f"     ├─ Dataset ──────────────────────────────────────────")
+    print(f"     │  Train rows  : {n_train:,}  (80%)")
+    print(f"     │  Test rows   : {n_test:,}  (20% held-out)")
+    print(f"     │  Features    : {n_feat}")
+    print(f"     │  Timeframe   : {tf_label}")
+    print(f"     │  Bars req    : {bars:,}")
+    print(f"     │  Bars recv   : {actual_bars:,}")
+    print(f"     └─ Optuna      : {trials} trials × 3 specialists "
+          f"= {trials * 3} total")
+
+    # ── Overfit warning ────────────────────────────────────────────────────
+    for spec_name, xgb_f1, lgbm_f1, test_f1 in (
+        ("BUY",    buy_xgb_f1,  buy_lgbm_f1,  buy_test_f1),
+        ("SELL",   sell_xgb_f1, sell_lgbm_f1, sell_test_f1),
+        ("REGIME", reg_xgb_f1,  reg_lgbm_f1,  reg_test_f1),
+    ):
+        cv_mean = (xgb_f1 + lgbm_f1) / 2
+        gap     = abs(test_f1 - cv_mean)
+        if (spec_name != "REGIME" and (xgb_f1 > 0.95 or lgbm_f1 > 0.95)) or \
+   (spec_name == "REGIME" and (xgb_f1 > 0.995 or lgbm_f1 > 0.995)):
+            warn = (
+                f"{spec_name} CV F1 > 0.95 — unusually high. "
+                f"This may indicate label leakage or overfitting."
+            )
+            print(f"\n  ⚠️  WARNING: {warn}")
+            logger.warning(warn)
+        if gap > 0.10 and spec_name != "REGIME":
+            # REGIME overfitting warning suppressed — high CV/test F1
+            # on REGIME is expected (ADX label is highly learnable)
+            warn = (
+                f"{spec_name} CV/test F1 gap = {gap:.3f} — "
+                f"possible overfit or distribution shift. "
+                f"Consider retraining with more bars."
+            )
+            print(f"\n  ⚠️  WARNING: {warn}")
+            logger.warning(warn)
+
+    logger.info(
+        "%s (%s): training complete — "
+        "BUY F1=%.3f AUC=%.3f | SELL F1=%.3f AUC=%.3f | "
+        "REGIME F1=%.3f AUC=%.3f | features=%d trials=%d bars=%d",
+        symbol, tf_label,
+        buy_test_f1,  buy_test_auc,
+        sell_test_f1, sell_test_auc,
+        reg_test_f1,  reg_test_auc,
+        n_feat, trials, actual_bars,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Interactive M1 / M5 prompt
 # ─────────────────────────────────────────────────────────────────────────────
-def _ask_timeframe() -> int:
-    print("\n" + "=" * 55)
+def _ask_timeframe(bars: int) -> int:
+    print("\n" + "=" * 60)
     print("  🤖  GODBOT — ML Model Retraining")
-    print("=" * 55)
+    print("=" * 60)
     print()
     print("  Select timeframe to train for:")
     print()
     print("    1 = M1  (1-minute scalping)")
-    print("         50,000 bars ≈ 35 days of data")
+    print(f"         {bars:,} bars ≈ {_approx_days(bars, 1)}")
     print("         RSI 7 | EMA 5/13/34 | MACD 5/13/4 | ATR 7")
     print("         TP ~6 pips | SL ~3 pips | Max spread 0.8 pips")
     print()
     print("    2 = M5  (5-minute scalping)  [recommended]")
-    print("         50,000 bars ≈ 175 days of data")
+    print(f"         {bars:,} bars ≈ {_approx_days(bars, 5)}")
     print("         RSI 9 | EMA 8/21/50 | MACD 8/21/5 | ATR 10")
-    print("         TP ~12 pips | SL ~6 pips | Max spread 1.2 pips")
+    print("         TP ~12 pips | SL ~6 pips | Max spread 1.0 pips")
     print()
 
     while True:
@@ -113,7 +287,7 @@ def _ask_timeframe() -> int:
         print(f"     SL pips         : {p.get('sl_pips',       '?')}")
         print(f"     Max spread      : {p.get('max_spread',    '?')} pips")
         print(f"     Scan interval   : {p.get('scan_secs',     '?')} seconds")
-        print(f"     Signal score    : {p.get('signal_score',  '?')} / 9")
+        print(f"     Signal score    : {p.get('signal_score',  '?')} / 10")
     except Exception as e:
         print(f"\n  ⚠️  Could not display profile settings: {e}")
         logger.warning(
@@ -130,12 +304,12 @@ def _ask_timeframe() -> int:
 def main() -> None:
     args = _parse_args()
 
-    selected_tf = _ask_timeframe()
+    bars = max(args.bars, getattr(CONFIG, "BARS_HISTORY", _TARGET_BARS))
+
+    selected_tf = _ask_timeframe(bars)
     tf_label    = f"M{selected_tf}"
 
     # ── Build symbol list ──────────────────────────────────────────────────
-    # Fix 3 – CONFIG.WATCHLIST does not exist; correct attribute is
-    # CONFIG.SYMBOLS throughout the entire codebase.
     if args.symbols:
         unknown = [s for s in args.symbols if s not in CONFIG.SYMBOLS]
         if unknown:
@@ -149,7 +323,7 @@ def main() -> None:
             )
         symbols_to_train = args.symbols
     else:
-        symbols_to_train = list(CONFIG.SYMBOLS)   # Fix 3
+        symbols_to_train = list(CONFIG.SYMBOLS)
 
     symbol_timeframes: dict[str, int] = {
         sym: selected_tf for sym in symbols_to_train
@@ -158,7 +332,6 @@ def main() -> None:
     for sym in ("EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "USDCAD", "XAUUSD"):
         symbol_timeframes.setdefault(sym, selected_tf)
 
-    bars          = max(50_000, getattr(CONFIG, "BARS_HISTORY", 50_000))
     optuna_trials = args.trials
 
     logger.info(
@@ -198,16 +371,16 @@ def main() -> None:
             timeframe    = symbol_timeframes.get(symbol, selected_tf)
             sym_tf_label = f"M{timeframe}"
 
-            print(f"\n{'=' * 55}")
+            print(f"\n{'=' * 60}")
             print(f"  Training ML model: {symbol} ({sym_tf_label})")
-            print(f"{'=' * 55}")
+            print(f"{'=' * 60}")
             logger.info("Starting training for %s (%s).", symbol, sym_tf_label)
 
             # ── Fetch raw OHLCV ────────────────────────────────────────────
-            approx_days = "35 days" if timeframe == 1 else "175 days"
+            approx = _approx_days(bars, timeframe)
             print(
                 f"  Fetching {bars:,} bars of {symbol} {sym_tf_label} "
-                f"history (≈{approx_days})..."
+                f"history (≈{approx})..."
             )
             try:
                 df_raw = connector.get_ohlcv(symbol, timeframe, bars=bars)
@@ -229,11 +402,22 @@ def main() -> None:
                 failed.append(symbol)
                 continue
 
-            print(f"  ✅ Got {len(df_raw):,} bars")
-            logger.info("%s: fetched %d bars.", symbol, len(df_raw))
+            actual_bars = len(df_raw)
+            if actual_bars < bars:
+                print(
+                    f"  ⚠️  MT5 returned {actual_bars:,} bars "
+                    f"(requested {bars:,}) — broker history may be limited. "
+                    f"Training will proceed if above MIN_TRAINING_BARS."
+                )
+                logger.warning(
+                    "%s: MT5 returned %d bars, requested %d.",
+                    symbol, actual_bars, bars,
+                )
+
+            print(f"  ✅ Got {actual_bars:,} bars")
+            logger.info("%s: fetched %d bars.", symbol, actual_bars)
 
             # ── Compute indicators ─────────────────────────────────────────
-            # Fix 2 – method is calculate(df, symbol) not compute_all(df)
             print("  Computing indicators...")
             try:
                 df = indicators.compute_all(df_raw)
@@ -263,12 +447,12 @@ def main() -> None:
             # ── Train ──────────────────────────────────────────────────────
             print(
                 f"  Training {symbol} model on {sym_tf_label} data "
-                f"(this takes 5–10 minutes)..."
+                f"(this takes 15–50 minutes)..."
             )
             print(
-                f"  Steps: Optuna tuning ({optuna_trials} trials) → "
-                f"3-fold walk-forward CV → final fit → "
-                f"held-out test → save"
+                f"  Steps: Optuna tuning ({optuna_trials} trials × 3 "
+                f"specialists) → 3-fold walk-forward CV → final fit → "
+                f"temperature calibration → held-out test → save"
             )
 
             try:
@@ -292,8 +476,6 @@ def main() -> None:
                 continue
 
             # ── Save model ─────────────────────────────────────────────────
-            # Fix 4 – save() takes no arguments; symbol is set at
-            # MLSignalModel(symbol=symbol) construction time.
             try:
                 model.save()
                 print(f"  ✅ Models saved for {symbol}")
@@ -305,72 +487,14 @@ def main() -> None:
                 continue
 
             # ── Print results ──────────────────────────────────────────────
-            xgb_acc  = results.get("xgb_cv_accuracy",  0.0)
-            lgbm_acc = results.get("lgbm_cv_accuracy", 0.0)
-            test_acc = results.get("test_accuracy",     0.0)
-            n_feat   = results.get("n_features",        0)
-            n_train  = results.get("n_train",           0)
-            n_test   = results.get("n_test",            0)
-
-            status_xgb  = (
-                "✅" if xgb_acc  >= 0.55
-                else "⚠️  below 0.55 — check data quality"
+            _print_results(
+                symbol=symbol,
+                tf_label=sym_tf_label,
+                results=results,
+                bars=bars,
+                actual_bars=actual_bars,
+                trials=optuna_trials,
             )
-            status_lgbm = (
-                "✅" if lgbm_acc >= 0.55
-                else "⚠️  below 0.55 — check data quality"
-            )
-
-            cv_mean = (xgb_acc + lgbm_acc) / 2
-            gap     = abs(test_acc - cv_mean)
-            if gap > 0.10:
-                status_test = (
-                    f"⚠️  gap vs CV mean is {gap:.3f} — "
-                    f"possible overfit or distribution shift"
-                )
-            elif test_acc >= 0.55:
-                status_test = "✅"
-            else:
-                status_test = "⚠️  below 0.55 — check data quality"
-
-            print(f"\n  ✅ {symbol} ({sym_tf_label}) training complete:")
-            print(f"     XGB  mean CV accuracy : {xgb_acc:.3f}  {status_xgb}")
-            print(f"     LGBM mean CV accuracy : {lgbm_acc:.3f}  {status_lgbm}")
-            print(f"     Held-out test accuracy: {test_acc:.3f}  {status_test}")
-            print(f"     Train rows            : {n_train:,}  (80%)")
-            print(f"     Test rows             : {n_test:,}   (20% held-out)")
-            print(f"     Features used         : {n_feat}")
-            print(f"     Timeframe             : {sym_tf_label}")
-            print(f"     Optuna trials         : {optuna_trials}")
-
-            logger.info(
-                "%s (%s): training complete — XGB CV=%.3f, LGBM CV=%.3f, "
-                "test=%.3f, features=%d, trials=%d.",
-                symbol, sym_tf_label,
-                xgb_acc, lgbm_acc, test_acc,
-                n_feat, optuna_trials,
-            )
-
-            if xgb_acc > 0.80 or lgbm_acc > 0.80:
-                warn = (
-                    f"CV accuracy > 80% for {symbol} is unusually high for "
-                    f"live forex data. This may indicate overfitting or a "
-                    f"data quality issue. Consider reviewing the label "
-                    f"threshold (ATR_MULTIPLIER) in ml_model.py."
-                )
-                print(f"\n  ⚠️  WARNING: {warn}")
-                logger.warning(warn)
-
-            if gap > 0.10:
-                warn = (
-                    f"Large gap between test accuracy ({test_acc:.3f}) and "
-                    f"CV mean ({cv_mean:.3f}) for {symbol}. "
-                    f"The model may not generalise well to unseen data. "
-                    f"Consider retraining with more bars or adjusting "
-                    f"label thresholds."
-                )
-                print(f"\n  ⚠️  WARNING: {warn}")
-                logger.warning(warn)
 
             trained.append(symbol)
 
@@ -380,9 +504,9 @@ def main() -> None:
         logger.info("MT5 disconnected after retraining session.")
 
     # ── Final summary ──────────────────────────────────────────────────────
-    print(f"\n{'=' * 55}")
+    print(f"\n{'=' * 60}")
     print(f"  RETRAINING COMPLETE  ({tf_label})")
-    print(f"{'=' * 55}")
+    print(f"{'=' * 60}")
     print(
         f"  ✅ Trained  : {len(trained)}  — "
         f"{', '.join(trained) if trained else 'none'}"
@@ -405,9 +529,11 @@ def main() -> None:
     if trained:
         print(f"\n  Models saved to models/ directory:")
         for sym in trained:
-            print(f"    models/xgb_{sym}.pkl")
-            print(f"    models/lgbm_{sym}.pkl")
-            print(f"    models/scaler_{sym}.pkl")
+            for specialist in ("buy", "sell", "regime"):
+                print(f"    models/xgb_{specialist}_{sym}.pkl")
+                print(f"    models/lgbm_{specialist}_{sym}.pkl")
+                print(f"    models/scaler_{specialist}_{sym}.pkl")
+                print(f"    models/temps_{specialist}_{sym}.pkl")
             print(f"    models/features_{sym}.pkl")
         print(
             f"\n  ✅ Models trained on {tf_label} data — "

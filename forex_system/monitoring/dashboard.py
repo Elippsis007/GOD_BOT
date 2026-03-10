@@ -138,8 +138,13 @@ class Dashboard:
             else:
                 self.signals_log = []
         except Exception as exc:
-            logger.debug("Load signals_log error: %s", exc)
+            logger.warning("Load signals_log error (resetting): %s", exc)
             self.signals_log = []
+            # Nuke corrupted file
+            try:
+                os.remove("reports/signals_log.json")
+            except Exception:
+                pass
 
         try:
             if os.path.exists("reports/trades_log.json"):
@@ -152,9 +157,13 @@ class Dashboard:
                 self._all_trades = []
                 self.trades_log  = []
         except Exception as exc:
-            logger.debug("Load trades_log error: %s", exc)
+            logger.warning("Load trades_log error (resetting): %s", exc)
             self._all_trades = []
             self.trades_log  = []
+            try:
+                os.remove("reports/trades_log.json")
+            except Exception:
+                pass
 
     def _save_logs(self) -> None:
         try:
@@ -170,14 +179,17 @@ class Dashboard:
         except Exception as exc:
             logger.debug("Save logs error: %s", exc)
 
+    # ── Dashboard output file ─────────────────────────────────────────────────
+    # Written every second; the popup PowerShell window reads this file.
+    # This keeps the VS Code terminal clean for the scrolling log stream.
+    _DASHBOARD_FILE: str = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "dashboard_live.txt",
+    )
+
     # ── Main display entry ────────────────────────────────────────────────────
 
     def display(self) -> None:
-        """
-        [F] Build complete output in a string buffer, print in one write
-        to minimise the blank-screen window between clear and first render.
-        Runs in a background thread, refreshing every second.
-        """
         while True:
             try:
                 acc_info = self._connector.get_account_info()
@@ -186,23 +198,27 @@ class Dashboard:
             except Exception:
                 pass
 
-            lines: List[str] = []
-            lines += self._header_lines()
-            lines += self._account_panel_lines()
-            lines += self._positions_panel_lines()
-            lines += self._signals_panel_lines()
-            lines += self._performance_panel_lines()
-            lines += self._analytics_panel_lines()
-            lines += self._footer_lines()
+            try:
+                lines: List[str] = []
+                lines += self._header_lines()
+                lines += self._account_panel_lines()
+                lines += self._positions_panel_lines()
+                lines += self._signals_panel_lines()
+                lines += self._performance_panel_lines()
+                lines += self._analytics_panel_lines()
+                lines += self._footer_lines()
 
-            output = "\n".join(lines)
-            self._clear_screen()
-            sys.stdout.write(output + "\n")
-            sys.stdout.flush()
+                output = "\n".join(lines)
+                # ── Write to file instead of stdout ───────────────────────
+                # The popup window reads this file and reprints it every
+                # second.  The VS Code terminal is left completely free
+                # for the clean scrolling log stream — no screen clearing.
+                with open(self._DASHBOARD_FILE, "w", encoding="utf-8") as fh:
+                    fh.write(output + "\n")
+            except Exception as exc:
+                logger.exception("‼️ Dashboard display() error: %s", exc)
+
             time.sleep(1.0)
-
-    def force_refresh(self) -> None:
-        self.display()
 
     # ── Header ────────────────────────────────────────────────────────────────
 
@@ -772,31 +788,34 @@ class Dashboard:
 
     def update_signal(self, symbol: str, signal, position_spec) -> None:
         try:
+            raw       = getattr(signal, "signal", None) or getattr(signal, "signal_type", "HOLD")
+            direction = raw.value if hasattr(raw, "value") else str(raw).upper()
+            
             self.log_signal(
-                symbol     = symbol,
-                direction  = str(signal.signal_type).upper(),
-                entry      = float(signal.entry),
-                sl         = float(
-                    getattr(position_spec, "sl_price",
-                            getattr(position_spec, "sl", 0.0))
-                ),
-                tp         = float(
-                    getattr(position_spec, "tp_price",
-                            getattr(position_spec, "tp", 0.0))
-                ),
-                confidence = float(
-                    getattr(position_spec, "confidence",
-                            getattr(signal, "confidence", 0.0))
-                ),
-                sl_pips    = float(
-                    getattr(position_spec, "sl_pips",
-                            getattr(signal, "sl_pips", None) or 0.0)
-                ),
-                tp_pips    = float(
-                    getattr(position_spec, "tp_pips",
-                            getattr(signal, "tp_pips", None) or 0.0)
-                ),
-            )
+            symbol     = symbol,
+            direction  = direction,
+            entry      = float(signal.entry),
+            sl         = float(
+                getattr(position_spec, "sl_price",
+                        getattr(position_spec, "sl", 0.0))
+            ),
+            tp         = float(
+                getattr(position_spec, "tp_price",
+                        getattr(position_spec, "tp", 0.0))
+            ),
+            confidence = float(
+                getattr(position_spec, "confidence",
+                        getattr(signal, "confidence", 0.0))
+            ),
+            sl_pips    = float(
+                getattr(position_spec, "sl_pips",
+                        getattr(signal, "sl_pips", None) or 0.0)
+            ),
+            tp_pips    = float(
+                getattr(position_spec, "tp_pips",
+                        getattr(signal, "tp_pips", None) or 0.0)
+            ),
+        )
         except Exception as exc:
             logger.warning("[Dashboard] update_signal() error: %s", exc)
 
@@ -881,4 +900,12 @@ class Dashboard:
     # ── Utility ───────────────────────────────────────────────────────────────
 
     def _clear_screen(self) -> None:
-        os.system("cls" if os.name == "nt" else "clear")
+        # \033[H    = move cursor to top-left (home)
+        # \033[2J   = clear visible screen from cursor
+        # \033[3J   = clear scrollback buffer (required by VS Code terminal
+        #             to prevent the dashboard appending as a list instead
+        #             of redrawing in place — without this, each 1-second
+        #             refresh appends below the previous render)
+        # Order matters: home first, then clear forward, then clear scrollback.
+        sys.stdout.write("\033[H\033[2J\033[3J")
+        sys.stdout.flush()

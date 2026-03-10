@@ -1,0 +1,63 @@
+=================================================================
+  🤖 GODBOT v3.0  |  2026-03-10 23:33:05 Madrid/CET
+  Mode: Full Auto  |  Style: Scalper  |  TF: M5
+=================================================================
+
+📊 ACCOUNT OVERVIEW
+----------------------------------------
+  Account  : 62111571
+  Balance  :       180.61 EUR
+  Equity   :       180.61 EUR  🟢 (+0.00)
+  Margin   :         0.00 EUR  (0.0% of equity)
+  Free Mrgn:       180.61 EUR
+  Leverage : 1:30
+
+📈 OPEN POSITIONS (0)
+-----------------------------------------------------------------
+  No open positions
+
+🎯 TODAY'S SIGNALS (7 total)
+-----------------------------------------------------------------
+  🟢 EURUSD   BUY   | E:1.16530   | SL:6p TP:12p | Conf:85% | 10:20:11
+  🟢 EURUSD   BUY   | E:1.16565   | SL:6p TP:12p | Conf:85% | 10:16:28
+  🟢 EURUSD   BUY   | E:1.16544   | SL:6p TP:12p | Conf:85% | 09:05:15
+  🟢 EURUSD   BUY   | E:1.16557   | SL:6p TP:12p | Conf:85% | 09:03:34
+  🟢 EURUSD   BUY   | E:1.16587   | SL:6p TP:12p | Conf:85% | 09:01:14
+  🟢 EURUSD   BUY   | E:1.16593   | SL:6p TP:12p | Conf:85% | 09:00:02
+
+📉 TODAY'S PERFORMANCE
+----------------------------------------
+  Trades   : 3
+  Wins     : 1 🟢
+  Losses   : 2 🔴
+  Win Rate : 33.3%
+  Total P&L: -1.70 EUR
+  Prof Fact: 0.124  ⚠️
+  Best     : +0.24
+  Worst    : -1.57
+  Close By :
+    ⚠️  Danger        : 1
+    📋 Broker closed : 2
+
+📊 ROLLING ANALYTICS  (7-day)
+-----------------------------------------------------------------
+  Trades (7d)  : 13
+  Win Rate     : 30.8%
+  Profit Factor: 0.306  ⚠️
+  Expectancy   : EUR -0.2246 per trade
+  Consec Losses: 2  🟡
+
+  Session Breakdown:
+    London  :   3 trades | WR  33.3% | 🔴 EUR-1.70
+    NY      :  10 trades | WR  30.0% | 🔴 EUR-1.22
+
+  Close Reason (7d):
+    ⚠️  Danger        :   4  ( 30.8%)
+    📋 Broker closed :   3  ( 23.1%)
+    ❓ Unknown       :   6  ( 46.2%)
+
+=================================================================
+  ⏱️  Next scan in   9s  |  ⏳ Waiting  |  Last: 7m 33s ago
+  Mode: FullAuto | TF: M5
+  Keys: 1=SigOnly  2=SemiAuto  3=FullAuto  P=Pause  M=Menu  Q=Quit
+=================================================================
